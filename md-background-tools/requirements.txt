@@ -1,0 +1,5 @@
+numpy>=1.24
+pillow>=10.0
+PySide6>=6.5
+scipy>=1.10
+numba>=0.58   # optional: ~50x faster dithering
