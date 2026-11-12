@@ -388,6 +388,191 @@ def render_variant(rgb, base, pals, resp, mode):
             "rgb_hl": rgb_hl}
 
 
+# --------------------------------------------------------------------------
+# parallel workers (v2.9)
+# --------------------------------------------------------------------------
+# Every variant (one palette count x dither x budget x shadow group) is
+# independent, and the slow part - the tile reduction - runs on one core. So
+# the sweep spreads the palettes and then the variants over worker processes.
+# Each worker gets the source picture once (initializer) and writes its own
+# thumbnails, full previews and exports; the parent only collects the records
+# and prints the progress. Results are identical to the one-process run.
+_STATE = {}
+_ACTIVE_POOL = None
+WORKER_RAM_GB = 1.6      # peak memory of one worker per megapixel (measured: 1.66 GB at 1.07 MP)
+
+
+def _set_active_pool(p):
+    global _ACTIVE_POOL
+    _ACTIVE_POOL = p
+
+
+def stop_sweep():
+    """Kill the worker processes of a running sweep (used when the window closes)."""
+    p = _ACTIVE_POOL
+    if p is None:
+        return
+    for proc in list(getattr(p, "_processes", {}).values()):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def _free_ram_gb():
+    try:
+        import ctypes
+
+        class MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = MS()
+        m.dwLength = ctypes.sizeof(MS)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return m.ullAvailPhys / 1024 ** 3
+    except Exception:
+        return 8.0
+
+
+def sweep_workers(asked, n_jobs, rgb):
+    """How many worker processes: the user's number, or auto.
+
+    Auto = physical cores minus one, but no more than the free memory allows
+    (WORKER_RAM_GB each, scaled by the picture size) and never more than the
+    number of variants."""
+    try:
+        asked = int(asked or 0)
+    except (TypeError, ValueError):
+        asked = 0
+    if asked > 0:
+        sweep_workers.why = "chosen by hand"
+        return max(1, min(asked, n_jobs))
+    cpus = os.cpu_count() or 2
+    cores = max(1, cpus // 2 if cpus >= 4 else cpus)
+    mp_ = rgb.shape[0] * rgb.shape[1] / 1e6
+    per = max(0.4, WORKER_RAM_GB * mp_)
+    free = _free_ram_gb()
+    by_ram = max(1, int((free - 0.5) / per))
+    n = max(1, min(max(1, cores - 1), by_ram, n_jobs))
+    sweep_workers.why = (f"{cores} cores, {free:.1f} GB of memory free, about "
+                         f"{per:.1f} GB per process for this image")
+    if n < min(cores - 1, n_jobs) and by_ram == n:
+        sweep_workers.why += " - limited by memory: close other programs for more"
+    return n
+
+
+def _start_pool(workers, state):
+    import concurrent.futures as cf
+    import multiprocessing as mp_mod
+    ctx = mp_mod.get_context("spawn")
+    pool = cf.ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                                  initializer=_sweep_init, initargs=(state,))
+    _set_active_pool(pool)
+    return pool
+
+
+def _as_done(pool, fn, items):
+    import concurrent.futures as cf
+    futs = {pool.submit(fn, it): it for it in items}
+    for f in cf.as_completed(futs):
+        yield futs[f], f.result()
+
+
+def _sweep_init(state):
+    _STATE.clear()
+    _STATE.update(state)
+    set_view_height(int(state.get("view_height") or 224))
+
+
+def _sweep_palette_job(key_):
+    n, plan, pd = key_
+    st = _STATE
+    r = dict(st["resp"])
+    r["palettes"] = n
+    r["dithering"] = pd
+    r["mode"] = "shadow" if plan else "normal"
+    t = time.time()
+    pals, _, _ = optimize_palettes(st["rgb"], r, seed=st["seed"], rounds=st["rounds"])
+    return [np.asarray(p, np.uint8) for p in pals], time.time() - t
+
+
+def _sweep_variant_job(j):
+    """One base (palettes x dither x budget x shadow group) and its modes."""
+    st = _STATE
+    rgb, out = st["rgb"], st["out"]
+    n, dith, strength, column, vq, plan = (j["n"], j["dith"], j["strength"],
+                                           j["column"], j["vq"], j["plan"])
+    pals = j["pals"]
+    r = dict(st["resp"])
+    r.update(palettes=n, dithering=dith, dither_strength=strength,
+             mode="shadow" if plan else "normal", max_tiles=vq)
+    t = time.time()
+    base = build_base(rgb, pals, r, vq=vq, seed=st["seed"])
+    lines = [f"  base {n}p/{column}/t{vq}{' shadow' if plan else ''}: "
+             f"{time.time() - t:.1f}s  {base['tiles']} tiles  peak {base['peak'][0]}"]
+    recs = []
+    x, y, cw, ch = st["crop"]
+    x = max(0, min(x, rgb.shape[1] - 1))
+    y = max(0, min(y, rgb.shape[0] - 1))
+    cw = min(cw, rgb.shape[1] - x)
+    ch = min(ch, rgb.shape[0] - y)
+    for mode in j["modes"]:
+        rr = dict(r)
+        rr["mode"] = mode
+        var = render_variant(rgb, base, pals, rr, mode)
+        stem = f"p{n}_{dith}_{strength}_t{vq}_{mode}"
+        thumb = os.path.join(st["thumbs"], stem + ".png")
+        Image.fromarray(var["rgb"][y:y + ch, x:x + cw]).save(thumb)
+        hl_thumb = None
+        if var.get("rgb_hl") is not None:
+            hl_thumb = os.path.join(st["thumbs"], stem + "_hl.png")
+            Image.fromarray(var["rgb_hl"][y:y + ch, x:x + cw]).save(hl_thumb)
+        full = None
+        if st["full"]:
+            full = os.path.join(st["full_dir"], stem + ".png")
+            Image.fromarray(var["rgb"]).save(full)
+        p = base["peak"]
+        cap_ok = (base["tiles"] <= vq if st["cap_scope"] == "image" else p[0] <= vq)
+        kb = (base["bytes_tiles"] + base["bytes_map"] + 32 * n) / 1024.0
+        rec = {
+            "palettes": n, "dithering": dith, "strength": strength,
+            "column": column, "max_tiles": vq, "mode": mode,
+            "tiles": base["tiles"], "bytes_tiles": base["bytes_tiles"],
+            "bytes_map": base["bytes_map"],
+            "peak": p[0], "peak_x0": p[1] * 8, "peak_y0": p[2] * 8,
+            "peak_x1": p[3] * 8, "peak_y1": p[4] * 8,
+            "de_mean": var["de_mean"], "de_p95": var["de_p95"],
+            "de_max": var["de_max"], "de_perceived": var["de_perceived"],
+            "shadow_tiles": (int(var["shadow_mask"].sum())
+                             if var["shadow_mask"] is not None else 0),
+            "hl_tiles": var["hl_tiles"], "hl_gain": var["hl_gain"],
+            "de_hl": var.get("de_hl"), "hl_sprites": var.get("hl_sprites"),
+            "hl_thumb": (os.path.relpath(hl_thumb, out).replace("\\", "/")
+                         if hl_thumb else None),
+            "palette_usage": base["palette_usage"],
+            "bytes_total": base["bytes_tiles"] + base["bytes_map"] + 32 * n,
+            "kb_total": round(kb, 1), "cap_ok": cap_ok,
+            "thumb": os.path.relpath(thumb, out).replace("\\", "/"),
+            "full": os.path.relpath(full, out).replace("\\", "/") if full else None,
+        }
+        if st["export"]:
+            exp_dir = os.path.join(out, "export", stem)
+            export_variant(exp_dir, c_name(st["base_name"]), base, var, pals,
+                           dict(rr, source=st["source"]), stem)
+            rec["export"] = os.path.relpath(os.path.join(exp_dir, "res"),
+                                            out).replace("\\", "/")
+        if var.get("hl_sprites") is not None:
+            rec["hl_note"] = (f"{highlight_note(var['hl_sprites'])}; dE with it "
+                              f"{var['de_hl']:.2f} (not exported)")
+        recs.append(rec)
+        lines.append(f"{stem}: dE {var['de_mean']:.2f} / perc "
+                     f"{var['de_perceived']:.2f} · {kb:.1f} KB total")
+    return recs, lines
+
+
 def cmd_sweep(a):
     """Generate a comparison grid of setup answers, without asking per cell."""
     set_view_height(int(getattr(a, "view_height", None) or 224))
@@ -519,22 +704,8 @@ def cmd_sweep(a):
     # MIX into a tone it lacks, so a dark gradient sky came out flat lilac in
     # normal and as dark shadow blocks in shadow. --palette-dither <name>
     # keeps one shared palette per count, optimized with that dither.
-    pal_cache = {}
-
-    def palettes_for(n, plan, dith):
-        pd = dith if pd_mode == "same" else pd_mode
-        key_ = (n, plan, pd)
-        if key_ not in pal_cache:
-            r = dict(resp)
-            r["palettes"] = n
-            r["dithering"] = pd
-            r["mode"] = "shadow" if plan else "normal"
-            t = time.time()
-            pal_cache[key_], _, _ = optimize_palettes(rgb, r, seed=a.seed,
-                                                     rounds=a.palette_rounds)
-            print(f"  palettes {n}{' (shadow planned)' if plan else ''}, "
-                  f"optimized with {pd}: {time.time() - t:.1f}s")
-        return pal_cache[key_]
+    def pal_key(n, plan, dith):
+        return (n, plan, dith if pd_mode == "same" else pd_mode)
 
     variants = []
     crop = _parse_crop(a.crop)
@@ -543,92 +714,67 @@ def cmd_sweep(a):
         x = max(0, min(x, rgb.shape[1] - 1))
         y = max(0, min(y, rgb.shape[0] - 1))
         crop = (x, y, min(cw, rgb.shape[1] - x), min(ch, rgb.shape[0] - y))
-    done = 0
-    t_all = time.time()
+    else:
+        # thumbnails show the busiest view of the source (known before any
+        # variant runs, so every worker crops the same place)
+        crop = (info["pior_x0"] * 8, info["pior_y0"] * 8,
+                (info["pior_x1"] - info["pior_x0"]) * 8,
+                (info["pior_y1"] - info["pior_y0"]) * 8)
+
+    jobs = []
     for n in palettes:
-      for dith, strength, column in dither_specs:
-        for vq in budgets:
-            for plan, gmodes in groups:
-                pals = palettes_for(n, plan, dith)
-                r = dict(resp)
-                r["palettes"] = n
-                r["dithering"] = dith
-                r["dither_strength"] = strength
-                r["mode"] = "shadow" if plan else "normal"
-                r["max_tiles"] = vq
-                t = time.time()
-                base = build_base(rgb, pals, r, vq=vq, seed=a.seed)
-                if crop is None:
-                    p = base["peak"]
-                    crop = (p[1] * 8, p[2] * 8, (p[3] - p[1]) * 8, (p[4] - p[2]) * 8)
-                print(f"  base {n}p/{column}/t{vq}{' shadow' if plan else ''}: "
-                      f"{time.time() - t:.1f}s  "
-                      f"{base['tiles']} tiles  peak {base['peak'][0]}")
-                for mode in gmodes:
-                    rr = dict(r)
-                    rr["mode"] = mode
-                    var = render_variant(rgb, base, pals, rr, mode)
-                    stem = f"p{n}_{dith}_{strength}_t{vq}_{mode}"
-                    thumb = os.path.join(thumbs, stem + ".png")
-                    x, y, cw, ch = crop
-                    x = max(0, min(x, rgb.shape[1] - 1))
-                    y = max(0, min(y, rgb.shape[0] - 1))
-                    cw = min(cw, rgb.shape[1] - x)
-                    ch = min(ch, rgb.shape[0] - y)
-                    im = Image.fromarray(var["rgb"][y:y + ch, x:x + cw])
-                    im.save(thumb)
-                    hl_thumb = None
-                    if var.get("rgb_hl") is not None:
-                        # best-case highlight overlay, shown apart: not exported
-                        hl_thumb = os.path.join(thumbs, stem + "_hl.png")
-                        Image.fromarray(var["rgb_hl"][y:y + ch, x:x + cw]).save(hl_thumb)
-                    full = None
-                    if a.full:
-                        full = os.path.join(full_dir, stem + ".png")
-                        Image.fromarray(var["rgb"]).save(full)
-                    p = base["peak"]
-                    cap_ok = (base["tiles"] <= vq if cap_scope == "image"
-                              else p[0] <= vq)
-                    variants.append({
-                        "palettes": n, "dithering": dith, "strength": strength,
-                        "column": column, "max_tiles": vq, "mode": mode,
-                        "tiles": base["tiles"],
-                        "bytes_tiles": base["bytes_tiles"],
-                        "bytes_map": base["bytes_map"],
-                        "peak": p[0], "peak_x0": p[1] * 8, "peak_y0": p[2] * 8,
-                        "peak_x1": p[3] * 8, "peak_y1": p[4] * 8,
-                        "de_mean": var["de_mean"], "de_p95": var["de_p95"],
-                        "de_max": var["de_max"], "de_perceived": var["de_perceived"],
-                        "shadow_tiles": (int(var["shadow_mask"].sum())
-                                         if var["shadow_mask"] is not None else 0),
-                        "hl_tiles": var["hl_tiles"], "hl_gain": var["hl_gain"],
-                        "de_hl": var.get("de_hl"),
-                        "hl_sprites": var.get("hl_sprites"),
-                        "hl_thumb": (os.path.relpath(hl_thumb, out).replace("\\", "/")
-                                     if hl_thumb else None),
-                        "palette_usage": base["palette_usage"],
-                        "bytes_total": (base["bytes_tiles"] + base["bytes_map"]
-                                        + 32 * n),
-                        "kb_total": round((base["bytes_tiles"] + base["bytes_map"]
-                                           + 32 * n) / 1024.0, 1),
-                        "cap_ok": cap_ok,
-                        "thumb": os.path.relpath(thumb, out).replace("\\", "/"),
-                        "full": (os.path.relpath(full, out).replace("\\", "/")
-                                 if full else None),
-                    })
-                    if getattr(a, "export", False):
-                        exp_dir = os.path.join(out, "export", stem)
-                        export_variant(exp_dir, c_name(base_name), base, var, pals,
-                                       dict(rr, source=a.source), stem)
-                        variants[-1]["export"] = os.path.relpath(
-                            os.path.join(exp_dir, "res"), out).replace("\\", "/")
-                    done += 1
-                    kb = (base["bytes_tiles"] + base["bytes_map"] + 32 * n) / 1024.0
-                    print(f"    [{done}/{total}] {stem}: dE {var['de_mean']:.2f} "
-                          f"/ perc {var['de_perceived']:.2f} · {kb:.1f} KB total")
-                    if var.get("hl_sprites") is not None:
-                        print(f"        {highlight_note(var['hl_sprites'])}; "
-                              f"dE with it {var['de_hl']:.2f} (not exported)")
+        for dith, strength, column in dither_specs:
+            for vq in budgets:
+                for plan, gmodes in groups:
+                    jobs.append(dict(i=len(jobs), n=n, dith=dith, strength=strength,
+                                     column=column, vq=vq, plan=plan, modes=gmodes))
+    keys = []
+    for j in jobs:
+        k_ = pal_key(j["n"], j["plan"], j["dith"])
+        if k_ not in keys:
+            keys.append(k_)
+
+    workers = sweep_workers(getattr(a, "workers", 0), len(jobs), rgb)
+    state = dict(rgb=rgb, resp=resp, seed=a.seed, rounds=a.palette_rounds,
+                 full=bool(a.full), export=bool(getattr(a, "export", False)),
+                 source=a.source, out=out, thumbs=thumbs, full_dir=full_dir,
+                 crop=crop, base_name=base_name, cap_scope=cap_scope,
+                 view_height=WIN_H * 8, total=total)
+    print(f"  workers: {workers} process{'es' if workers > 1 else ''} "
+          f"({getattr(sweep_workers, 'why', '')}; --workers to change)")
+    t_all = time.time()
+    pal_cache = {}
+    done = 0
+    pool = None
+    try:
+        if workers > 1:
+            pool = _start_pool(workers, state)
+            run = lambda fn, items: _as_done(pool, fn, items)   # noqa: E731
+        else:
+            _sweep_init(state)
+            run = lambda fn, items: ((it, fn(it)) for it in items)   # noqa: E731
+        for k_, (pals, secs) in run(_sweep_palette_job, keys):
+            pal_cache[k_] = pals
+            n, plan, pd = k_
+            print(f"  palettes {n}{' (shadow planned)' if plan else ''}, "
+                  f"optimized with {pd}: {secs:.1f}s", flush=True)
+        for j in jobs:
+            j["pals"] = pal_cache[pal_key(j["n"], j["plan"], j["dith"])]
+        results = {}
+        for j, (recs, lines) in run(_sweep_variant_job, jobs):
+            results[j["i"]] = recs
+            print(lines[0], flush=True)
+            for rec, extra in zip(recs, lines[1:]):
+                done += 1
+                print(f"    [{done}/{total}] {extra}", flush=True)
+                if rec.get("hl_note"):
+                    print(f"        {rec['hl_note']}", flush=True)
+        for i in sorted(results):
+            variants.extend(results[i])
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+            _set_active_pool(None)
 
     dt = time.time() - t_all
     ref_path = os.path.join(out, "reference.png")
@@ -755,6 +901,8 @@ def main():
     s.add_argument("--backdrop", choices=("border", "color"), default="border")
     s.add_argument("--backdrop-color")
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--workers", type=int, default=0,
+                   help="worker processes (0 = auto: cores - 1, limited by free memory)")
     s.add_argument("--export", action="store_true",
                    help="also write the palette (.pal), map (JSON), indexed PNG, "
                         ".res and report for every variant, in export/<variant>/")
@@ -833,4 +981,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(main())

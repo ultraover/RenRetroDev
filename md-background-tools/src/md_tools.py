@@ -22,7 +22,7 @@ for _d in (HERE, SWEEP_DIR):
         sys.path.insert(0, _d)
 
 TITLE = "MD Background Tools"
-VERSION = "1.0"
+VERSION = "1.1"
 
 TOOLS = [
     ("background-gui", "Background · window",
@@ -163,6 +163,10 @@ def start_screen():
 
 
 def main():
+    # the sweep runs its variants in worker processes; in the frozen .exe each
+    # worker re-runs this .exe, and freeze_support hands it to multiprocessing
+    import multiprocessing
+    multiprocessing.freeze_support()
     args = sys.argv[1:]
     if len(args) >= 2 and args[0] == "--run":
         return run_tool(args[1], args[2:])

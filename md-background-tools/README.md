@@ -25,7 +25,7 @@ One program, four tools, picked from a start screen:
 
 ## Quick start (Windows)
 
-1. Download `MD_Background_Tools.exe` from the [latest release](https://github.com/ultraover/RenRetroDev/releases/tag/md-background-tools-v1.0).
+1. Download `MD_Background_Tools.exe` from the [release page](https://github.com/ultraover/RenRetroDev/releases/tag/md-background-tools-v1.1).
 2. Double-click it and pick a tool.
 3. In **Background · window**, drop an image, choose the options and press
    **Generate samples**. Compare the four samples, pick one, press **Export**.
@@ -92,15 +92,17 @@ MD_Background_Tools.exe --run background-console emit --samples pic/samples.json
 MD_Background_Tools.exe --run sweep-console sweep --source pic.png --palettes 1,2 --dithering none,floyd,riemersma --modes normal,shadow --max-tiles 900,700 --export
 ```
 
-Add `--help` after `sample` or `sweep` for every option. Useful sweep flags:
+Add `--help` after `sample` or `sweep` for every option. The sweep runs several
+variants at once on several CPU cores (`--workers N`; default: cores − 1, limited
+by free memory). Useful sweep flags:
 `--palette-dither none` (one shared palette, faster), `--shadow-late` (old shadow,
 decided at the end), `--full` (full-size previews), `--view-height 240` (PAL).
 
 ## Known limitations
 
 - **Tile reduction is slow on big images.** A wide scrolling background with a
-  tight per-view budget can take several minutes per variant (the sweep shows
-  an estimate before it starts).
+  tight per-view budget can take several minutes per variant. The sweep runs
+  variants in parallel on several cores, but each variant still uses one.
 - **Highlight is measured, not exported.** On hardware it needs sprites over the
   area; the tool tells you how many and whether they fit.
 - **Shadow works per 8×8 tile.** The tool softens the border of shadow regions on

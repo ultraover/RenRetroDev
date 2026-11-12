@@ -21,7 +21,7 @@ from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QGridLayout, QGroupBox,
     QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QSpinBox,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -142,6 +142,14 @@ class SweepWindow(QWidget):
         self.cb_paldith.addItem("no dithering, one palette for all (faster, old way)", "none")
         self.cb_paldith.currentIndexChanged.connect(self.update_projection)
         pl.addWidget(self.cb_paldith, 1)
+        pl.addWidget(QLabel("CPU processes:"))
+        self.sp_workers = QSpinBox()
+        self.sp_workers.setRange(0, max(1, os.cpu_count() or 1))
+        self.sp_workers.setSpecialValueText("auto")
+        self.sp_workers.setToolTip("How many variants are computed at the same time. "
+                                   "auto = cores - 1, limited by the free memory "
+                                   "(about 1.5 GB per process on a big image).")
+        pl.addWidget(self.sp_workers)
         root.addLayout(pl)
 
         self.ck_full = QCheckBox(
@@ -395,7 +403,7 @@ class SweepWindow(QWidget):
             palettes=",".join(pals), dithering=",".join(diths),
             dither_strength=",".join(strengths), modes=",".join(modes),
             palette_dither=self.paldith(), palette_rounds=2,
-            export=self.ck_export.isChecked(),
+            export=self.ck_export.isChecked(), workers=self.sp_workers.value(),
             max_tiles=f"{self.ed_t1.text().strip()},{self.ed_t2.text().strip()}",
             cap_scope="auto", crop=None, full=self.ck_full.isChecked(), gain="auto",
             brightness=0.0, bg_color=None, no_pad=False, pad_color=None,
@@ -410,6 +418,27 @@ class SweepWindow(QWidget):
         self.worker.log.connect(self._log)
         self.worker.done.connect(self._done)
         self.worker.start()
+
+    def closeEvent(self, e):
+        """Closing during a sweep: ask, then stop the worker processes cleanly.
+
+        Qt aborts the whole program when a window closes while its worker
+        thread still runs, so the close is handled here instead."""
+        if self.worker is not None and self.worker.isRunning():
+            r = QMessageBox.question(
+                self, "Sweep running",
+                "A sweep is still running. Stop it and close?" + chr(10) + chr(10) +
+                "The variants already finished stay in the output folder, "
+                "but the HTML page is only written at the end.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                e.ignore()
+                return
+            try:
+                md.stop_sweep()
+            finally:
+                os._exit(0)
+        e.accept()
 
     def _log(self, text):
         cur = self.log.textCursor()
@@ -446,4 +475,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(main())

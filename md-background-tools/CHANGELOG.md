@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1 (2026-11-12)
+
+- The sweep computes palettes and variants in parallel on several CPU cores
+  (`--workers`, and "CPU processes" in the window); results are identical.
+- Closing the sweep window during a run asks first and stops cleanly.
+
 ## 1.0 (2026-11-12)
 
 First public release.
