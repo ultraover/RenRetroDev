@@ -9,6 +9,7 @@ from md_fundo_v2.py.
 md_fundo_v2.py is looked up, in order: the folder in MD_FUNDO_DIR, this
 folder.
 """
+import argparse
 import contextlib
 import csv
 import io
@@ -191,7 +192,9 @@ def _write_sweep_html(out, meta, rgb):
                         f'dE mean {v["de_mean"]:.2f} · <b>perc {perc:.2f}</b>'
                         f' · p95 {v["de_p95"]:.1f}<br>'
                         f'{unit} {v["peak"]}{cap}'
-                        f'{shadow_hl_html(v)}</div></td>')
+                        f'{shadow_hl_html(v)}'
+                        f'<br><span class="nm">{html.escape(variant_stem(v))}</span>'
+                        f'</div></td>')
                 label = (f'<th class="pal" rowspan="{len(modes)}">{n} palette'
                          f'{"s" if n > 1 else ""}</th>' if mi == 0 else "")
                 rows.append(f'<tr>{label}<th class="mode">{html.escape(mode)}</th>'
@@ -217,6 +220,7 @@ def _write_sweep_html(out, meta, rgb):
     .view img{max-width:none;max-height:none;width:auto;height:auto}
     .m{font-size:10px;color:#9ab;white-space:nowrap;line-height:1.45}
     .warn{color:#f88}
+    .nm{color:#678;user-select:all}
     details{margin-top:18px} summary{cursor:pointer;color:#8cf}
     """
     summary = (f"{meta['width']}x{meta['height']} px · {len(meta['variants'])} "
@@ -272,6 +276,55 @@ for (const v of views) {{
 </details>
 </html>"""
     open(os.path.join(out, "sweep.html"), "w", encoding="utf-8").write(doc)
+
+
+def _sweep_inputs(a):
+    """The prepared source and the shared answers of a sweep.
+
+    Used by the sweep and by the export of one variant, so a variant exported
+    later is computed from exactly the same picture, backdrop and options.
+    """
+    bg = parse_fill(a.bg_color)
+    rgb0 = load(a.source, bg)
+    rgb0, _ = apply_pad(rgb0, a)
+    if rgb0.shape[0] % 8 or rgb0.shape[1] % 8:
+        raise SystemExit(f"image sides must be multiples of 8: "
+                         f"{rgb0.shape[1]}x{rgb0.shape[0]}")
+    gain = auto_gain(rgb0) if a.gain in (None, "auto") else float(a.gain)
+    rgb = prepare(rgb0, gain, float(a.brightness or 0))
+    w, h = rgb.shape[1], rgb.shape[0]
+    pan = (w > 320 or h > 224)
+    cap_scope = a.cap_scope if a.cap_scope != "auto" else ("view" if pan else "image")
+    if a.backdrop == "color" and a.backdrop_color:
+        chave = parse_fill(a.backdrop_color)
+    else:
+        chave = border_key(rgb)
+    key_src = [int(v) for v in np.asarray(chave).reshape(-1)[:3]]
+    chave = snap_md(np.asarray(chave, np.float64).reshape(1, 1, 3))[0, 0]
+    key = [int(v) for v in chave]
+    if a.backdrop == "color" and a.backdrop_color:
+        key_holes, why = True, "colour chosen by the author"
+    else:
+        key_holes, _, why = backdrop_is_real(rgb, key_src, a.source)
+    resp = {
+        "palettes": None, "palette_file": None, "mode": None,
+        "transparency": True, "dithering": None,
+        "dither_strength": None, "scroll": pan, "resize": "none",
+        "max_tiles": None, "cap_scope": cap_scope,
+        "backdrop": a.backdrop, "backdrop_rgb": a.backdrop_color,
+        "oversize": "none", "gain": gain, "brightness": float(a.brightness or 0),
+        "key": key, "key_src": key_src, "view_height": WIN_H * 8,
+        "key_holes": bool(key_holes),
+    }
+    resp["sprite"] = transparent_fraction(a.source) > 0.05
+    # v2.10: flat dark shadow regions ringed by bright detail go normal, on
+    # one solid colour, instead of a dotted halo (--shadow-dotted-edges = old)
+    resp["shadow_clean"] = not bool(getattr(a, "shadow_dotted_edges", False))
+    # v2.11: a flat shape with a sharp outline (a door) is never split between
+    # normal and shadow tiles (--shadow-free-contours = old, each tile alone)
+    resp["shadow_contour"] = not bool(getattr(a, "shadow_free_contours", False))
+    return dict(rgb=rgb, gain=gain, pan=pan, cap_scope=cap_scope, key=key,
+                key_src=key_src, key_holes=key_holes, why=why, resp=resp)
 
 
 def build_base(rgb, pals, resp, vq=None, seed=0):
@@ -594,19 +647,10 @@ def cmd_sweep(a):
             for s in strengths:
                 dither_specs.append((d, s, f"{d}/{s}"))
 
-    bg = parse_fill(a.bg_color)
-    rgb0 = load(a.source, bg)
-    rgb0, pad_note = apply_pad(rgb0, a)
-    if rgb0.shape[0] % 8 or rgb0.shape[1] % 8:
-        raise SystemExit(f"image sides must be multiples of 8: "
-                         f"{rgb0.shape[1]}x{rgb0.shape[0]}")
-    gain = auto_gain(rgb0) if a.gain in (None, "auto") else float(a.gain)
-    rgb = prepare(rgb0, gain, float(a.brightness or 0))
-
+    inp = _sweep_inputs(a)
+    rgb, gain, pan, cap_scope = inp["rgb"], inp["gain"], inp["pan"], inp["cap_scope"]
+    key, key_holes, why, resp = inp["key"], inp["key_holes"], inp["why"], inp["resp"]
     w, h = rgb.shape[1], rgb.shape[0]
-    pan = (w > 320 or h > 224)
-    scroll = pan
-    cap_scope = a.cap_scope if a.cap_scope != "auto" else ("view" if pan else "image")
 
     if w > 512 or h > 512:
         print(f"\nWARNING: {w}x{h} is above 512x512. No resize and no split: "
@@ -638,29 +682,8 @@ def cmd_sweep(a):
             "the image, raise both budgets to the auto max, or use "
             "cap_scope=image.")
 
-    if a.backdrop == "color" and a.backdrop_color:
-        chave = parse_fill(a.backdrop_color)
-    else:
-        chave = border_key(rgb)
-    key_src = [int(v) for v in np.asarray(chave).reshape(-1)[:3]]
-    chave = snap_md(np.asarray(chave, np.float64).reshape(1, 1, 3))[0, 0]
-    key = [int(v) for v in chave]
-    if a.backdrop == "color" and a.backdrop_color:
-        key_holes, why = True, "colour chosen by the author"
-    else:
-        key_holes, _, why = backdrop_is_real(rgb, key_src, a.source)
-
-    resp = {
-        "palettes": palettes[0], "palette_file": None, "mode": modes[0],
-        "transparency": True, "dithering": dithers[0],
-        "dither_strength": strengths[0], "scroll": scroll, "resize": "none",
-        "max_tiles": budgets[0], "cap_scope": cap_scope,
-        "backdrop": a.backdrop, "backdrop_rgb": a.backdrop_color,
-        "oversize": "none", "gain": gain, "brightness": float(a.brightness or 0),
-        "key": key, "key_src": key_src, "view_height": WIN_H * 8,
-        "key_holes": bool(key_holes),
-    }
-    resp["sprite"] = transparent_fraction(a.source) > 0.05
+    resp.update(palettes=palettes[0], mode=modes[0], dithering=dithers[0],
+                dither_strength=strengths[0], max_tiles=budgets[0])
 
     base_name = os.path.splitext(os.path.basename(a.source))[0]
     raw_out = os.path.normpath(a.out or os.path.join(os.getcwd(), f"sweep_{base_name}"))
@@ -680,6 +703,13 @@ def cmd_sweep(a):
     print(f"  backdrop: #{key[0]:02X}{key[1]:02X}{key[2]:02X}  "
           f"budgets {budgets} ({cap_scope})")
     print(f"  transparent backdrop holes: {'yes' if key_holes else 'NO'} ({why})")
+    if any(m in ("shadow", "both") for m in modes):
+        print("  shadow borders: " + ("clean (flat dark areas ringed by bright detail "
+              "go normal on one solid colour)" if resp["shadow_clean"]
+              else "dotted (--shadow-dotted-edges)"))
+        print("  shadow contours: " + ("kept (flat shapes with an outline are not split "
+              "between normal and shadow)" if resp["shadow_contour"]
+              else "free (--shadow-free-contours)"))
     pd_mode = getattr(a, "palette_dither", None) or "same"
     if pd_mode == "same":
         print("  palettes: optimized with each variant's own dithering (one per "
@@ -793,13 +823,14 @@ def cmd_sweep(a):
         "pan": pan, "auto_max": auto_max, "auto_75": auto_75,
         "sprite": bool(resp.get("sprite")),
         "estimated_seconds": round(est, 1), "full_images": bool(a.full),
-        "crop": list(crop), "seconds": round(dt, 1), "variants": variants,
+        "crop": list(crop), "seconds": round(dt, 1),
+        "args": sweep_args(a), "variants": variants,
     }
     json.dump(meta, open(os.path.join(out, "sweep.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
     with open(os.path.join(out, "sweep.csv"), "w", encoding="utf-8",
               newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(variants[0]))
+        w = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for v in variants for k in v)))
         w.writeheader()
         w.writerows(variants)
     _write_sweep_html(out, meta, rgb)
@@ -807,6 +838,184 @@ def cmd_sweep(a):
     print(f"  {os.path.join(out, 'sweep.html')}")
     print(f"  {os.path.join(out, 'sweep.json')}")
     show_link("sweep", os.path.join(out, "sweep.html"))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# export of ONE variant, after the sweep (v2.11)
+# --------------------------------------------------------------------------
+# --export writes the files of every variant. Usually only one is wanted, the
+# one picked in the gallery, so a sweep folder can be handed back with the
+# name of a variant: it is computed again from the options kept in sweep.json
+# (same picture, seed, palette rounds, shadow rules) and checked pixel by
+# pixel against its thumbnail and full-size preview.
+ARG_KEYS = ("source", "palettes", "dithering", "modes", "dither_strength",
+            "palette_dither", "palette_rounds", "max_tiles", "cap_scope",
+            "view_height", "crop", "gain", "brightness", "bg_color", "no_pad",
+            "pad_color", "backdrop", "backdrop_color", "seed", "shadow_dotted_edges",
+            "shadow_free_contours", "shadow_late")
+# sweeps written before v2.11 kept no options: these are the window's
+# defaults, and the contour rule did not exist yet
+OLD_SWEEP_ARGS = dict(bg_color=None, no_pad=False, pad_color=None, gain="auto",
+                      brightness=0.0, backdrop="border", backdrop_color=None, seed=0,
+                      palette_rounds=2, palette_dither="same", shadow_late=False,
+                      shadow_dotted_edges=False, shadow_free_contours=True,
+                      view_height=224, cap_scope="auto", crop=None)
+
+
+def sweep_args(a):
+    out = {}
+    for k in ARG_KEYS:
+        v = getattr(a, k, None)
+        if isinstance(v, (str, int, float, bool, type(None))):
+            out[k] = v
+    return out
+
+
+def variant_stem(v):
+    return os.path.splitext(os.path.basename(v["thumb"]))[0]
+
+
+def variant_label(v):
+    n = v["palettes"]
+    kb = v.get("kb_total")
+    kb = f" · {kb:.1f} KB" if kb is not None else ""
+    return (f'{n} palette{"s" if n > 1 else ""} · {v["column"]} · '
+            f'{v["max_tiles"]} tiles · {v["mode"]} - dE {v["de_mean"]:.2f} · '
+            f'perc {v.get("de_perceived", v["de_mean"]):.2f}{kb}')
+
+
+def load_sweep(folder):
+    """(folder, meta) of a sweep folder or of its sweep.json."""
+    folder = os.path.abspath(folder.strip().strip('"'))
+    if os.path.isfile(folder):
+        folder = os.path.dirname(folder)
+    path = os.path.join(folder, "sweep.json")
+    if not os.path.isfile(path):
+        raise SystemExit(f"no sweep.json in {folder}")
+    with open(path, encoding="utf-8") as f:
+        return folder, json.load(f)
+
+
+def export_one(folder, stem, log=print):
+    """Compute one variant of a sweep again and write its files.
+
+    Returns (export folder, identical): identical is True when the variant
+    came out pixel for pixel as the sweep drew it (thumbnail and, when it
+    exists, the full-size preview)."""
+    folder, meta = load_sweep(folder)
+    found = [v for v in meta["variants"] if variant_stem(v) == stem]
+    if not found:
+        raise SystemExit(f"variant not found in this sweep: {stem}")
+    v = found[0]
+    saved = meta.get("args")
+    d = dict(OLD_SWEEP_ARGS)
+    if saved:
+        d.update(saved)
+    else:
+        log("  note: this sweep was made before v2.11 and kept no options; "
+            "using the window defaults")
+    d["source"] = meta["source"]
+    d["gain"] = meta["gain"]
+    d["view_height"] = int(meta.get("view_height") or d.get("view_height") or 224)
+    a = argparse.Namespace(**d)
+    if not os.path.isfile(a.source):
+        raise SystemExit(f"the source image of this sweep is gone: {a.source}")
+    set_view_height(a.view_height)
+    t = time.time()
+    inp = _sweep_inputs(a)
+    rgb, resp = inp["rgb"], inp["resp"]
+    resp["cap_scope"] = meta.get("cap_scope", resp["cap_scope"])
+    n, dith, strength = v["palettes"], v["dithering"], v["strength"]
+    vq, mode = v["max_tiles"], v["mode"]
+    plan = (not a.shadow_late) and mode in ("shadow", "both")
+    pd_mode = meta.get("palette_dither") or "same"
+    r = dict(resp, palettes=n, dithering=dith if pd_mode == "same" else pd_mode,
+             mode="shadow" if plan else "normal")
+    log(f"  {stem}: palettes...")
+    pals, _, _ = optimize_palettes(rgb, r, seed=a.seed, rounds=a.palette_rounds)
+    pals = [np.asarray(p, np.uint8) for p in pals]
+    r2 = dict(resp, palettes=n, dithering=dith, dither_strength=strength,
+              mode="shadow" if plan else "normal", max_tiles=vq)
+    log(f"  {stem}: tiles...")
+    base = build_base(rgb, pals, r2, vq=vq, seed=a.seed)
+    rr = dict(r2, mode=mode)
+    var = render_variant(rgb, base, pals, rr, mode)
+    # the check: what the sweep drew
+    x, y, cw, ch = meta["crop"]
+    x = max(0, min(x, rgb.shape[1] - 1))
+    y = max(0, min(y, rgb.shape[0] - 1))
+    cw = min(cw, rgb.shape[1] - x)
+    ch = min(ch, rgb.shape[0] - y)
+    diffs = []
+    for rel, img in ((v.get("thumb"), var["rgb"][y:y + ch, x:x + cw]),
+                     (v.get("full"), var["rgb"])):
+        if rel and os.path.isfile(os.path.join(folder, rel)):
+            ref = np.asarray(Image.open(os.path.join(folder, rel)).convert("RGB"))
+            if ref.shape != img.shape:
+                diffs.append(ref.shape[0] * ref.shape[1])
+            else:
+                diffs.append(int((ref != img).any(2).sum()))
+    identical = bool(diffs) and max(diffs) == 0
+    exp_dir = os.path.join(folder, "export", stem)
+    base_name = os.path.splitext(os.path.basename(a.source))[0]
+    res = export_variant(exp_dir, c_name(base_name), base, var, pals,
+                         dict(rr, source=a.source), stem)
+    v["export"] = os.path.relpath(os.path.dirname(res), folder).replace(os.sep, "/")
+    with open(os.path.join(folder, "sweep.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    _write_sweep_html(folder, meta, rgb)
+    if identical:
+        log(f"  {stem}: identical to the sweep preview ({time.time() - t:.0f}s)")
+    elif diffs:
+        log(f"  {stem}: WARNING - differs from the sweep preview in "
+            f"{max(diffs)} pixels (the sweep was made with another version or "
+            f"other options); the files match export/{stem}/1.png, not the gallery")
+    log(f"  files: {exp_dir}")
+    return exp_dir, identical
+
+
+def cmd_export(a):
+    folder, meta = load_sweep(a.sweep)
+    stems = [variant_stem(v) for v in meta["variants"]]
+    if not a.variant:
+        print(f"variants of {folder}:")
+        for i, v in enumerate(meta["variants"], 1):
+            print(f"  {i:3d}  {variant_stem(v)}   ({variant_label(v)})")
+        print("")
+        print("export one with --variant <name or number>")
+        return 0
+    picked = []
+    for item in a.variant.split(","):
+        item = item.strip()
+        if item.isdigit() and 1 <= int(item) <= len(stems):
+            item = stems[int(item) - 1]
+        picked.append(item)
+    ok = True
+    for stem in picked:
+        _, same = export_one(folder, stem)
+        ok = ok and same
+    return 0 if ok else 2
+
+
+def _export_interactive(folder):
+    """Double-clicked console, a sweep folder given: pick variants by number."""
+    folder, meta = load_sweep(folder)
+    stems = [variant_stem(v) for v in meta["variants"]]
+    print("")
+    print(f"sweep: {folder}")
+    for i, v in enumerate(meta["variants"], 1):
+        print(f"  {i:3d}  {variant_label(v)}")
+    print("")
+    try:
+        ans = input("export which? number(s), comma separated (Enter = none): ").strip()
+    except EOFError:
+        ans = ""
+    for item in [t.strip() for t in ans.split(",") if t.strip()]:
+        if not item.isdigit() or not 1 <= int(item) <= len(stems):
+            print(f"  not a number from the list: {item}")
+            continue
+        export_one(folder, stems[int(item) - 1])
     return 0
 
 
@@ -906,11 +1115,27 @@ def main():
     s.add_argument("--export", action="store_true",
                    help="also write the palette (.pal), map (JSON), indexed PNG, "
                         ".res and report for every variant, in export/<variant>/")
+    s.add_argument("--shadow-dotted-edges", action="store_true",
+                   help="keep the shadow in flat dark regions ringed by bright "
+                        "detail (old way: a dotted halo on their border); by "
+                        "default they go normal on one solid colour")
+    s.add_argument("--shadow-free-contours", action="store_true",
+                   help="let each tile of a flat shape with a sharp outline (a door) "
+                        "pick normal or shadow on its own (old way); by default the "
+                        "shape takes one state, dark ones shadow - contour before colour")
     s.add_argument("--shadow-late", action="store_true",
                    help="old shadow: decide it per finished tile, after the "
                         "palettes, dither and reduction (default: plan it "
                         "with the palettes)")
     s.set_defaults(func=cmd_sweep, cmd="sweep")
+
+    e = sub.add_parser("export", aliases=["exportar"],
+                       help="write the palette, map and .res of ONE variant of a sweep")
+    e.add_argument("--sweep", required=True, help="the sweep folder (or its sweep.json)")
+    e.add_argument("--variant", help="variant name as shown under each picture in "
+                   "sweep.html (or its number); comma list for several; "
+                   "blank = list them")
+    e.set_defaults(func=cmd_export, cmd="export")
 
     sub.add_parser("selftest").set_defaults(func=lambda a: selftest())
 
@@ -939,6 +1164,7 @@ def main():
             print("md_fundo - Mega Drive background tool")
             print("")
             print("type the path of the image (drag it into this window),")
+            print("or of a sweep folder to export one of its variants,")
             print("or press Enter to see the command line help.")
             print("")
             try:
@@ -953,6 +1179,11 @@ def main():
                 print(f"not found: {caminho}")
                 _pausa()
                 return 1
+            if (os.path.isdir(caminho) or
+                    os.path.basename(caminho).lower() == "sweep.json"):
+                rc = _export_interactive(caminho)
+                _pausa()
+                return rc
             a = ap.parse_args(["sweep", "--source", caminho])
             rc = a.func(a)
             _pausa()

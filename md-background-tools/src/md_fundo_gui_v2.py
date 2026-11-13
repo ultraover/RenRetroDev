@@ -278,6 +278,27 @@ class OptionsWindow(QWidget):
         self.cb_mode = QComboBox()
         self.cb_mode.addItems(md.MODES)
         f.addRow("Mode", self.cb_mode)
+        self.ck_clean = QCheckBox("clean shadow border (flat dark areas: one solid colour)")
+        self.ck_clean.setChecked(True)
+        self.ck_clean.setToolTip(
+            "With shadow: a flat dark area ringed by bright detail (a pit next to rock)\n"
+            "goes normal on one solid colour, so its border shows no dotted halo.\n"
+            "Unchecked: keeps the shadow there (old way).")
+        self.ck_clean.setEnabled(False)
+        self.cb_mode.currentTextChanged.connect(
+            lambda t: self.ck_clean.setEnabled(t in ("shadow", "both")))
+        f.addRow("", self.ck_clean)
+        self.ck_contour = QCheckBox("keep contours (doors, windows: contour before colour)")
+        self.ck_contour.setChecked(True)
+        self.ck_contour.setToolTip(
+            "With shadow: a flat shape with a sharp outline (a door in a dark wall)\n"
+            "is never split between normal and shadow tiles, so its outline stays.\n"
+            "Dark shapes go shadow even when the colour is a little less exact.\n"
+            "Unchecked: each tile picks on its own (old way).")
+        self.ck_contour.setEnabled(False)
+        self.cb_mode.currentTextChanged.connect(
+            lambda t: self.ck_contour.setEnabled(t in ("shadow", "both")))
+        f.addRow("", self.ck_contour)
         self.cb_backdrop = QComboBox()
         self.cb_backdrop.addItems(["from border", "fixed color"])
         f.addRow("Backdrop (index 0)", self.cb_backdrop)
@@ -434,6 +455,8 @@ class OptionsWindow(QWidget):
             "cap_scope": "view" if self.cb_scope.currentIndex() == 1 else "image",
             "backdrop": "color" if fixed else "border",
             "backdrop_rgb": self.bt_backdrop.property("hex") if fixed else None,
+            "shadow_clean": self.ck_clean.isChecked(),
+            "shadow_contour": self.ck_contour.isChecked(),
         }
 
     def dragEnterEvent(self, e):

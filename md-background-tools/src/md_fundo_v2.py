@@ -978,6 +978,15 @@ def _box3(img):
     return sum(p[dy:dy + h, dx:dx + w] for dy in range(3) for dx in range(3)) / 9.0
 
 
+# v2.10: share of the per-pixel (grain) error in the NORMAL vs SHADOW decision.
+# The dither scores (3x3 blur for the diffusions, perfect pair mix for the
+# ordered ones) forgive the dots, so a dotted normal tile tied with a smooth,
+# faithful shadow tile and the shadow margin kept the dots (dark pit of
+# a cave background). Only that decision sees the grain: used to pick among the
+# normal palettes too, it flattened skies into 8x8 solid patches.
+DITHER_GRAIN_W = 0.25
+
+
 def _dither_error(lab_flat, lab_pal, idx, shape):
     """Error a dithered result really leaves, as the eye mixes it (3x3 blur)."""
     h, w = shape
@@ -993,13 +1002,16 @@ def _paint_lab_err(lab, lab_pal, shape, mode, strength=DITHER_DEFAULT):
     if mode == "none":
         i0 = dd.argmin(1)
         return i0.reshape(shape), np.sqrt(dd[row, i0]).reshape(shape)
+    ordered = None
     if mode.startswith("ordered"):
-        return _ordered_mix(lab, lab_pal, shape, 4 if mode.endswith("4") else 8,
-                            strength)
-    if mode == "halftone":
-        return _ordered_mix(lab, lab_pal, shape, 4, strength, matrix=HALFTONE4)
-    if mode == "bluenoise":
-        return _ordered_mix(lab, lab_pal, shape, 16, strength, matrix=BLUE16)
+        ordered = _ordered_mix(lab, lab_pal, shape, 4 if mode.endswith("4") else 8,
+                               strength)
+    elif mode == "halftone":
+        ordered = _ordered_mix(lab, lab_pal, shape, 4, strength, matrix=HALFTONE4)
+    elif mode == "bluenoise":
+        ordered = _ordered_mix(lab, lab_pal, shape, 16, strength, matrix=BLUE16)
+    if ordered is not None:
+        return ordered
     s = _diffusion_strength(strength)
     if mode == "atkinson":
         out = _diffuse(lab, lab_pal, shape, ATKINSON_KERNEL, s)
@@ -1949,12 +1961,19 @@ def palette_options(rgb, pals, resp):
         pal = np.asarray(pal, np.uint8)
         i, e = _paint_lab_err(lab, rgb_to_lab(pal[base:]), (h, w), resp["dithering"],
                               resp.get("dither_strength", DITHER_DEFAULT))
+        e2 = (e ** 2).reshape(-1)
+        if resp["dithering"] == "none":
+            g2 = e2.copy()          # no dots: the score is the plain error
+        else:
+            lp = rgb_to_lab(pal[base:])
+            g2 = e2 + DITHER_GRAIN_W * ((lab - lp[i.reshape(-1)]) ** 2).sum(1)
         i = i + base
         if mask is not None:
             i.reshape(-1)[mask] = 0
-            e.reshape(-1)[mask] = (0.0 if hole_err is None
-                                   else hole_err[1 if j >= len(pals) else 0])
-        opts.append((i, (e ** 2).reshape(h, w)))
+            he = 0.0 if hole_err is None else hole_err[1 if j >= len(pals) else 0]
+            e2[mask] = np.asarray(he) ** 2
+            g2[mask] = e2[mask]
+        opts.append((i, e2.reshape(h, w), g2.reshape(h, w)))
     return opts
 
 
@@ -1964,7 +1983,7 @@ SHADOW_FLAT_MARGIN = 2.0  # extra dE shadow must win by on a flat tile
 SHADOW_FLAT_STD = 8.0    # source tile Lab std where a tile counts as flat
 
 
-def shadow_choice(rgb, block, n):
+def shadow_choice(rgb, block, n, score=None):
     """Normal or shadow per tile, with a margin and neighbour coherence.
 
     The plain argmin let every tile pick on its own: on a smooth sky the
@@ -1982,7 +2001,10 @@ def shadow_choice(rgb, block, n):
     bn = rm[:n].argmin(0)
     bs = rm[n:].argmin(0) + n
     iy, ix = np.arange(nh)[:, None], np.arange(nw)[None, :]
-    en, es = rm[bn, iy, ix], rm[bs, iy, ix]
+    # the state is judged on the grain-aware score (v2.10), the palette
+    # inside each state on the plain dither error
+    sc = rm if score is None else np.sqrt(np.maximum(score, 0.0))
+    en, es = sc[bn, iy, ix], sc[bs, iy, ix]
     lab = rgb_to_lab(rgb[:nh * 8, :nw * 8].reshape(-1, 3).astype(np.float64))
     lab = lab.reshape(nh, 8, nw, 8, 3).transpose(0, 2, 1, 3, 4).reshape(nh, nw, 64, 3)
     std = lab.std(axis=2).mean(axis=2)
@@ -2101,6 +2123,215 @@ def smooth_seams(rgb, block, n, tile_pal, shown):
     return tp.astype(np.uint8)
 
 
+CONTOUR_EDGE = 8.0      # dE between neighbour pixels that draws a contour
+CONTOUR_MIN_PX = 512    # pixels of a flat patch worth keeping whole (8 tiles)
+CONTOUR_SPREAD = 5.0    # mean dE from its own mean colour: flat, not gradient
+CONTOUR_MIN_IN = 4      # pixels of the patch a tile must hold to count
+CONTOUR_DARK = 0.95     # share of the patch in the shadow range: goes shadow
+_CONTOUR_CACHE = {}
+
+
+def contour_objects(rgb):
+    """Flat patches of the source ringed by a sharp contour, as tile masks.
+
+    A patch is a connected area whose neighbour pixels differ by less than
+    CONTOUR_EDGE and whose colour stays within CONTOUR_SPREAD of its mean (a
+    door, a window, a flat rock face; not a sky gradient, not texture).
+    Returns [(tiles, dark)], tiles a (nh, nw) mask of the tiles it touches,
+    dark when the shadow range can draw it. Cached per image.
+    """
+    import hashlib
+    from scipy import ndimage
+    a = np.ascontiguousarray(rgb)
+    key = (a.shape, hashlib.blake2b(a.tobytes(), digest_size=16).hexdigest())
+    if key in _CONTOUR_CACHE:
+        return _CONTOUR_CACHE[key]
+    h, w = a.shape[:2]
+    nh, nw = h // 8, w // 8
+    lab = rgb_to_lab(a.reshape(-1, 3).astype(np.float64)).reshape(h, w, 3)
+    g = np.zeros((h, w))
+    d = np.sqrt(((lab[:, 1:] - lab[:, :-1]) ** 2).sum(2))
+    g[:, 1:] = d
+    g[:, :-1] = np.maximum(g[:, :-1], d)
+    d = np.sqrt(((lab[1:] - lab[:-1]) ** 2).sum(2))
+    g[1:] = np.maximum(g[1:], d)
+    g[:-1] = np.maximum(g[:-1], d)
+    comps, nc = ndimage.label(g < CONTOUR_EDGE)
+    out = []
+    if nc:
+        ids = np.arange(1, nc + 1)
+        size = np.bincount(comps.reshape(-1), minlength=nc + 1)
+        mean = np.stack([np.bincount(comps.reshape(-1), lab[..., c].reshape(-1), nc + 1)
+                         for c in range(3)], 1) / np.maximum(size, 1)[:, None]
+        dev = np.sqrt(((lab - mean[comps]) ** 2).sum(2))
+        spread = np.bincount(comps.reshape(-1), dev.reshape(-1), nc + 1) / np.maximum(size, 1)
+        darkpx = (a.max(2) <= SHADOW_SEED_MAX).astype(np.float64)
+        dark = np.bincount(comps.reshape(-1), darkpx.reshape(-1), nc + 1) / np.maximum(size, 1)
+        keep = ids[(size[1:] >= CONTOUR_MIN_PX) & (spread[1:] <= CONTOUR_SPREAD)]
+        if len(keep):
+            cc = comps[:nh * 8, :nw * 8]
+            tile_id = (np.arange(nh)[:, None] * nw + np.arange(nw)[None, :])
+            tid = np.repeat(np.repeat(tile_id, 8, 0), 8, 1)
+            sel = np.isin(cc, keep)
+            pairs = cc[sel].astype(np.int64) * (nh * nw) + tid[sel]
+            u, cnt = np.unique(pairs, return_counts=True)
+            u, cnt = u[cnt >= CONTOUR_MIN_IN], cnt[cnt >= CONTOUR_MIN_IN]
+            comp_of, tile_of = u // (nh * nw), u % (nh * nw)
+            order = np.argsort(comp_of, kind="stable")
+            comp_of, tile_of = comp_of[order], tile_of[order]
+            starts = np.r_[0, np.nonzero(np.diff(comp_of))[0] + 1, len(comp_of)]
+            for s0, s1 in zip(starts[:-1], starts[1:]):
+                if s1 - s0 < 2:
+                    continue
+                t = np.zeros(nh * nw, bool)
+                t[tile_of[s0:s1]] = True
+                out.append((t.reshape(nh, nw), bool(dark[comp_of[s0]] >= CONTOUR_DARK)))
+    if len(_CONTOUR_CACHE) > 8:
+        _CONTOUR_CACHE.clear()
+    _CONTOUR_CACHE[key] = out
+    return out
+
+
+def keep_contours(rgb, block, n, tile_pal):
+    """A flat patch ringed by a contour is never split between normal and shadow.
+
+    With one palette and dither, the normal state could imitate a dark door
+    (a lighter teal plus dots) about as well as the shadow, so the middle of
+    the door went normal while its rim, which also holds the dark wall only
+    the shadow reaches, stayed shadow: two tones in 8x8 steps and the arch
+    lost its outline (ruins in a canyon). Now every tile a patch
+    touches takes one state: shadow when the patch is dark (the shadow draws
+    it), otherwise whichever costs less over those tiles. Contour first,
+    colour second - the author's call, behind resp["shadow_contour"].
+    A dark patch only moves its tiles that are dark as a whole: a tile that
+    also holds bright detail keeps its state, since shadow would dim that
+    detail (a lit pillar beside a door, the rock round a pit - the pit case
+    is settled by clean_shadow_edges, on one solid normal colour).
+    """
+    objs = contour_objects(rgb)
+    if not objs:
+        return tile_pal
+    seed = shadow_seed_tiles(rgb)
+    objs = [(t & seed, True) if dark else (t, False) for t, dark in objs]
+    objs = [(t, dark) for t, dark in objs if t.sum() >= 2]
+    rm = np.sqrt(np.maximum(block, 0.0))
+    bn = rm[:n].argmin(0)
+    bs = rm[n:].argmin(0) + n
+    iy, ix = np.indices(bn.shape)
+    tp = np.asarray(tile_pal).astype(np.int64).copy()
+    for _ in range(3):
+        moved = False
+        for t, dark in objs:
+            st = tp[t] >= n
+            if st.all() or not st.any():
+                continue
+            if dark:
+                go_shadow = True
+            else:
+                go_shadow = (rm[bs[t], iy[t], ix[t]].sum() <= rm[bn[t], iy[t], ix[t]].sum())
+            tp[t] = (bs if go_shadow else bn)[t]
+            moved = True
+        if not moved:
+            break
+    return tp.astype(np.uint8)
+
+
+CLEAN_MIN_TILES = 16    # shadow region size that is worth cleaning
+CLEAN_FLAT = 0.4        # mean flatness of the region (see SHADOW_FLAT_STD)
+CLEAN_FORCED = 0.6      # share of its border forced normal by bright detail
+CLEAN_DOMINANT = 0.75   # share of its dark pixels on ONE solid normal colour
+
+
+def clean_shadow_edges(rgb, pals, tile_pal, idx, stack, block, hole=None):
+    """Flat dark shadow regions ringed by bright detail go back to normal.
+
+    A tile that holds bright rock and a bit of the dark pit has to stay
+    normal (shadow would dim the rock), and the normal palette has no colour
+    for the shadowed tone of the pit (DAC steps 1, 3, 5, 7 exist only in
+    shadow), so its dark part was dithered: a dotted halo one tile wide around
+    the pit (a cave background). Measured, the halo was the more faithful option;
+    seen, the author preferred by far the pit and its border on ONE solid
+    normal colour, a little darker. So a shadow region that is flat, mostly
+    one tone, and whose border is mostly such forced tiles turns normal, and
+    its dark pixels and those of the forced border take the solid nearest
+    colour of their palette. Smooth gradients (many solid colours) and
+    detailed regions keep their shadow.
+    """
+    from scipy import ndimage
+    n = len(pals)
+    tp = np.asarray(tile_pal).astype(np.int64)
+    st = tp >= n
+    if not st.any():
+        return tile_pal, idx
+    h, w = rgb.shape[:2]
+    nh, nw = h // 8, w // 8
+
+    def per_tile(a):
+        return a[:nh * 8, :nw * 8].reshape(nh, 8, nw, 8).transpose(0, 2, 1, 3).reshape(nh, nw, 64)
+
+    dark_px = np.asarray(rgb).max(2) <= SHADOW_SEED_MAX
+    if hole is not None:
+        dark_px = dark_px & ~hole       # backdrop pixels stay index 0
+    dark = per_tile(dark_px).mean(2)
+    lab_px = rgb_to_lab(np.asarray(rgb).reshape(-1, 3).astype(np.float64)).reshape(h, w, 3)
+    lab_t = lab_px[:nh * 8, :nw * 8].reshape(nh, 8, nw, 8, 3).transpose(0, 2, 1, 3, 4)
+    std = lab_t.reshape(nh, nw, 64, 3).std(axis=2).mean(axis=2)
+    flat = np.clip(1.0 - std / SHADOW_FLAT_STD, 0.0, 1.0)
+    # forced normal: some dark pit and at least a couple of bright pixels
+    forced = ~st & (dark >= 0.2) & (dark <= 0.97) & (std >= 0.5 * SHADOW_FLAT_STD)
+    bn = block[:n].argmin(0)
+    comps, nc = ndimage.label(st)
+    lab_pals = [rgb_to_lab(np.asarray(p, np.float64)[1:]) for p in pals]
+    pal_px = np.repeat(np.repeat(bn, 8, 0), 8, 1)
+
+    def solid(mask_px, pal_of_px):
+        """Solid nearest colour (index) of each pixel's palette."""
+        ys, xs = np.nonzero(mask_px)
+        near = np.zeros(len(ys), np.int64)
+        pp = pal_of_px[ys, xs]
+        for p in range(n):
+            mine = pp == p
+            if mine.any():
+                near[mine] = dists(lab_px[ys[mine], xs[mine]], lab_pals[p]).argmin(1)
+        return ys, xs, near, pp
+
+    def one_tone(comp):
+        ys, xs, near, pp = solid(np.repeat(np.repeat(comp, 8, 0), 8, 1) & dark_px, pal_px)
+        key = pp * 16 + near
+        return len(key) > 0 and np.bincount(key).max() >= CLEAN_DOMINANT * len(key)
+
+    box = np.ones((3, 3), bool)
+    clean = np.zeros((nh, nw), bool)
+    for c in range(1, nc + 1):
+        comp = comps == c
+        if comp.sum() < CLEAN_MIN_TILES or flat[comp].mean() < CLEAN_FLAT:
+            continue
+        ring = ndimage.binary_dilation(comp, box) & ~comp
+        if ring.any() and forced[ring].mean() >= CLEAN_FORCED and one_tone(comp):
+            clean |= comp
+    if not clean.any():
+        return tile_pal, idx
+    # small shadow islands touching a cleaned region (also on a diagonal) go
+    # with it, or they are left as dark specks inside the clean pit
+    near_clean = ndimage.binary_dilation(clean, box)
+    for c in range(1, nc + 1):
+        comp = comps == c
+        if not (comp & clean).any() and (comp & near_clean).any() and one_tone(comp):
+            clean |= comp
+    # the regions turn normal: best normal palette, normal dither for the
+    # bright pixels, solid colour for the dark ones; the border (now all
+    # normal) gets the solid colour on its dark pixels too
+    out_tp = np.where(clean, bn, tp)
+    cp = np.repeat(np.repeat(clean, 8, 0), 8, 1)
+    out_idx = idx.copy()
+    out_idx[cp] = np.take_along_axis(stack[:n], pal_px[None], axis=0)[0][cp]
+    ring = ndimage.binary_dilation(clean, box) & ~clean & (out_tp < n)
+    paint = (cp | np.repeat(np.repeat(ring, 8, 0), 8, 1)) & dark_px
+    ys, xs, near, _ = solid(paint, np.repeat(np.repeat(out_tp, 8, 0), 8, 1))
+    out_idx[ys, xs] = near + 1
+    return out_tp.astype(np.uint8), out_idx
+
+
 def assign_palettes(rgb, pals, resp):
     """Every tile picks the palette that paints it with the lowest error.
 
@@ -2113,10 +2344,11 @@ def assign_palettes(rgb, pals, resp):
     opts = palette_options(rgb, pals, resp)
     stack = np.stack([o[0] for o in opts])
     block = np.stack([o[1].reshape(nh, 8, nw, 8).mean(axis=(1, 3)) for o in opts])
+    score = np.stack([o[2].reshape(nh, 8, nw, 8).mean(axis=(1, 3)) for o in opts])
     tile_pal = block.argmin(0).astype(np.uint8)
     if shadow_on(resp) and len(block) == 2 * len(pals):
         n = len(pals)
-        state = shadow_choice(rgb, block, n) >= n
+        state = shadow_choice(rgb, block, n, score) >= n
         bn = block[:n].argmin(0)
         bs = block[n:].argmin(0) + n
         tile_pal = np.where(state, bs, bn).astype(np.uint8)
@@ -2124,8 +2356,14 @@ def assign_palettes(rgb, pals, resp):
             effs = np.asarray(eff_pals(pals, resp), np.uint8)
             tile_pal = smooth_seams(rgb, block, n, tile_pal,
                                     [effs[j][stack[j]] for j in range(len(effs))])
-    rows = np.repeat(np.repeat(tile_pal, 8, 0), 8, 1)
+        if resp.get("shadow_contour", True):
+            tile_pal = keep_contours(rgb, block, n, tile_pal)
+    rows =np.repeat(np.repeat(tile_pal, 8, 0), 8, 1)
     idx = np.take_along_axis(stack, rows[None], axis=0)[0]
+    if (shadow_on(resp) and len(block) == 2 * len(pals)
+            and resp.get("shadow_clean", True)):
+        hole = backdrop_mask(rgb, resp) if resp.get("key") is not None else None
+        tile_pal, idx = clean_shadow_edges(rgb, pals, tile_pal, idx, stack, block, hole)
     iy = np.arange(nh)[:, None]
     ix = np.arange(nw)[None, :]
     err = float(block[tile_pal, iy, ix].sum())
@@ -2464,7 +2702,7 @@ def empty_profile():
             "preferences": {"palettes": 1, "palette_file": None, "mode": "normal",
                             "transparency": False, "dithering": "ordered4",
                             "dither_strength": DITHER_DEFAULT,
-                            "scroll": False, "resize": "none", "max_tiles": None, "cap_scope": "image", "oversize": "resize",
+                            "scroll": False, "resize": "none", "max_tiles": None, "cap_scope": "image", "oversize": "resize", "shadow_clean": True, "shadow_contour": True,
                             "recipe": "fidelity", "lambda": 0.35, "vq": None}}
 
 
@@ -2528,6 +2766,12 @@ def ask(args, profile):
                              or stored.get("backdrop_rgb")),
             "oversize": (getattr(args, "oversize", None)
                          or stored.get("oversize", "resize")),
+            "shadow_clean": (getattr(args, "shadow_edges", None) != "dotted"
+                             if getattr(args, "shadow_edges", None)
+                             else stored.get("shadow_clean", True)),
+            "shadow_contour": (getattr(args, "shadow_contours", None) != "off"
+                               if getattr(args, "shadow_contours", None)
+                               else stored.get("shadow_contour", True)),
         }
 
     factory = empty_profile()["preferences"]
@@ -2557,6 +2801,25 @@ def ask(args, profile):
         print(f"3) mode: {mode} (from the command line)")
     else:
         mode = _ask("3) Mode (normal, shadow, highlight, both)", factory["mode"], list(MODES))
+
+    shadow_clean = True
+    if mode in ("shadow", "both"):
+        if getattr(args, "shadow_edges", None):
+            shadow_clean = args.shadow_edges != "dotted"
+            print(f"3b) shadow border: {args.shadow_edges} (from the command line)")
+        else:
+            shadow_clean = _ask("3b) Shadow: flat dark areas ringed by bright detail -"
+                                " clean border (one solid colour) or dotted (old way)?",
+                                "clean", ["clean", "dotted"]) == "clean"
+    shadow_contour = True
+    if mode in ("shadow", "both"):
+        if getattr(args, "shadow_contours", None):
+            shadow_contour = args.shadow_contours != "off"
+            print(f"3c) keep contours: {args.shadow_contours} (from the command line)")
+        else:
+            shadow_contour = _ask("3c) Shadow: keep flat shapes with a sharp outline (doors,"
+                                  " windows) whole - contour before colour (on) or not (off)?",
+                                  "on", ["on", "off"]) == "on"
 
     if getattr(args, "backdrop", None):
         backdrop = args.backdrop
@@ -2653,7 +2916,8 @@ def ask(args, profile):
     return {"palettes": n, "palette_file": palette_file, "mode": mode,
             "transparency": trans, "dithering": dith, "dither_strength": dst,
             "scroll": scroll, "resize": resize, "max_tiles": max_tiles,
-            "cap_scope": cap_scope, "backdrop": backdrop, "backdrop_rgb": backdrop_rgb}
+            "cap_scope": cap_scope, "backdrop": backdrop, "backdrop_rgb": backdrop_rgb,
+            "shadow_clean": shadow_clean, "shadow_contour": shadow_contour}
 
 
 # --------------------------------------------------------------------------
@@ -3023,6 +3287,8 @@ def cmd_choose(a):
     p["max_tiles"] = data["answers"].get("max_tiles")
     p["cap_scope"] = data["answers"].get("cap_scope", "image")
     p["oversize"] = data["answers"].get("oversize", "resize")
+    p["shadow_clean"] = data["answers"].get("shadow_clean", True)
+    p["shadow_contour"] = data["answers"].get("shadow_contour", True)
     if chosen.get("vq"):
         p["vq"] = chosen["vq"]
         p["lambda"] = min(0.9, p.get("lambda", 0.35) + 0.10)
@@ -3134,6 +3400,28 @@ def do_emit(path, name, res, resp, n_arg=None):
         report.append(f"### palette {i}")
         for j, c in enumerate(pal):
             report.append(f"- {j:2d}: #{int(c[0]):02X}{int(c[1]):02X}{int(c[2]):02X}")
+    if chosen.get("shadow_rows"):
+        # v2.10: the priority bit that darkens a tile also decides what is drawn
+        # in front, and S/H mode turns two sprite colours into operators
+        report += ["", "## shadow in the game", "",
+                   "Shadow is the tile priority bit, and that bit does more than darken:",
+                   "",
+                   "- **Sprites:** the normal tiles of this image are HIGH priority, so they "
+                   "are drawn over every LOW priority sprite. Give the sprites that fly over "
+                   "this background high priority. Low priority sprites over a shadow tile "
+                   "are darkened too.",
+                   "- **The other plane:** a pixel is only darkened where plane A and plane B "
+                   "are both low priority there. A high priority tile on the other plane "
+                   "(a HUD, a foreground) turns the shadow off under it. If this image goes "
+                   "on plane B, its normal (high priority) tiles are drawn over the low "
+                   "priority tiles of plane A.",
+                   "- **PAL3 colours 14 and 15 on sprites:** with shadow/highlight on they are "
+                   "not drawn as colours. A sprite pixel of PAL3 colour 14 highlights what "
+                   "is under it, colour 15 shadows it. Do not use them as colours in "
+                   "sprites; colour 15 can be used on purpose to shadow pixel by pixel, "
+                   "finer than the 8x8 tiles.",
+                   "- **Backdrop:** index 0 on a shadow tile shows the backdrop at half "
+                   "brightness."]
     # ---- the C side: plane A only, window off, free scroll on the pad
     img_w, img_h = im.size
     tiles_w, tiles_h = (img_w + 7) // 8, (img_h + 7) // 8
@@ -3200,6 +3488,12 @@ def do_emit(path, name, res, resp, n_arg=None):
                    "    // NOTE: with shadow/highlight on, the backdrop (index 0) is also",
                    "    // shown at half brightness, and so is every low priority pixel",
                    "    // of plane B and of the sprites.",
+                   "    // The normal tiles are HIGH priority, so they also draw over low",
+                   "    // priority sprites: give your sprites high priority. A pixel is",
+                   "    // only darkened where plane A and plane B are both low priority,",
+                   "    // so keep plane B empty or low priority over this image. On",
+                   "    // sprites, PAL3 colours 14 and 15 stop being colours: 14",
+                   "    // highlights and 15 shadows what is under them (see the report).",
                    "    VDP_setHilightShadow(TRUE);"]
     elif resp["mode"] in ("highlight", "both"):
         report += ["",
@@ -3693,6 +3987,56 @@ def selftest():
     print(f"ok {ok}: fake backdrop detected, no shadow mosaic ({flips} flips), "
           "holes counted on shadow tiles")
 
+    # 21. a flat dark pit ringed by bright rock: the forced-normal border used
+    # to show a dotted halo; now the pit goes normal on one solid colour
+    rng = np.random.default_rng(3)
+    pit = np.clip(np.array([0, 200, 235]) + rng.normal(0, 25, (128, 128, 3)),
+                  0, 255).astype(np.uint8)
+    pit[:, :, 0] = 0
+    yy, xx = np.indices((128, 128))
+    inside = (np.abs(yy - 64) < 36) & (np.abs(xx - 64) < 36)   # off the tile grid
+    pit[inside] = (0, 70, 0)       # = shadow of (0, 116, 0), off the normal grid
+    pp = [np.array([[0, 0, 0], [0, 52, 0], [0, 87, 0], [0, 116, 0], [0, 144, 172],
+                    [0, 172, 206], [0, 206, 255], [0, 172, 172], [0, 206, 206],
+                    [0, 144, 206], [0, 255, 255], [0, 116, 144], [0, 172, 255],
+                    [0, 206, 172], [0, 144, 144], [0, 87, 116]], np.uint8)]
+    rp = dict(palettes=1, palette_file=None, transparency=True, dithering="floyd",
+              dither_strength="balanced", cap_scope="image", key=None,
+              key_holes=False, mode="shadow")
+    _, tp_off, _ = assign_palettes(pit, pp, dict(rp, shadow_clean=False))
+    idx_on, tp_on, _ = assign_palettes(pit, pp, rp)
+    core = np.zeros((16, 16), bool)
+    core[5:11, 5:11] = True
+    assert tp_off[core].min() >= 1, "without the cleaning the pit should use shadow"
+    assert tp_on[core].max() == 0, "the cleaned pit must be normal"
+    core_px = np.repeat(np.repeat(core, 8, 0), 8, 1)
+    assert len(np.unique(idx_on[core_px])) == 1, "the cleaned pit must be one solid colour"
+    ok += 1
+    print(f"ok {ok}: flat dark pit ringed by bright detail goes normal on one solid "
+          "colour (shadow kept with shadow_clean off)")
+
+    # 22. a flat dark shape (a door) split between normal and shadow tiles:
+    # keep_contours puts every tile it touches in shadow; a bright one takes
+    # the cheaper state
+    rng = np.random.default_rng(5)
+    img = np.clip(rng.normal(60, 22, (64, 64, 3)), 0, 120).astype(np.uint8)   # dark wall
+    img[12:44, 12:44] = (0, 36, 23)                 # off the tile grid
+    blk = np.stack([np.full((8, 8), 1.0), np.full((8, 8), 4.0)])   # normal cheaper
+    tp_in = np.zeros((8, 8), np.uint8)
+    tp_in[1, 1:6] = 1                    # the rim in shadow, the middle normal
+    out = keep_contours(img, blk, 1, tp_in)
+    door = np.zeros((8, 8), bool)
+    door[1:6, 1:6] = True
+    assert out[door].min() == 1, "every tile of the dark door must go shadow"
+    assert out[~door].max() == 0, "tiles outside the door must not change"
+    img2 = img.copy()
+    img2[12:44, 12:44] = (220, 220, 220)
+    out2 = keep_contours(img2, blk, 1, tp_in)
+    assert out2[door].max() == 0, "a bright flat shape takes the cheaper state (normal)"
+    ok += 1
+    print(f"ok {ok}: a flat shape with an outline is never split between normal and "
+          "shadow (dark goes shadow, bright takes the cheaper state)")
+
     print(f"\n{ok}/{ok} tests passed")
     return 0
 
@@ -3765,6 +4109,14 @@ def main():
         p.add_argument("--palette", choices=("own", "file"))
         p.add_argument("--palette-file")
         p.add_argument("--mode", choices=MODES)
+        p.add_argument("--shadow-edges", choices=("clean", "dotted"),
+                       help="shadow: flat dark areas ringed by bright detail go normal "
+                            "on one solid colour (clean, default) or keep the shadow "
+                            "and a dotted border (dotted, old way)")
+        p.add_argument("--shadow-contours", choices=("on", "off"),
+                       help="shadow: a flat shape with a sharp outline (a door) is never "
+                            "split between normal and shadow tiles; dark ones go shadow "
+                            "(on, default) - contour before colour")
         p.add_argument("--transparency", choices=("yes", "no"),
                        help="deprecated: index 0 is always the backdrop")
         p.add_argument("--backdrop", choices=("border", "color"),

@@ -22,7 +22,7 @@ for _d in (HERE, SWEEP_DIR):
         sys.path.insert(0, _d)
 
 TITLE = "MD Background Tools"
-VERSION = "1.1"
+VERSION = "1.2"
 
 TOOLS = [
     ("background-gui", "Background · window",

@@ -53,9 +53,11 @@ class _Worker(QThread):
     log = Signal(str)
     done = Signal(bool, str)
 
-    def __init__(self, args):
+    def __init__(self, args, job=None):
         super().__init__()
         self.args = args
+        # job: a callable returning the text handed to done (default: the sweep)
+        self.job = job
 
     def run(self):
         stream = _Stream()
@@ -63,8 +65,12 @@ class _Worker(QThread):
         try:
             with contextlib.redirect_stdout(stream), \
                     contextlib.redirect_stderr(stream):
-                md.cmd_sweep(self.args)
-            self.done.emit(True, getattr(self.args, "actual_out", ""))
+                if self.job is not None:
+                    out = self.job()
+                else:
+                    md.cmd_sweep(self.args)
+                    out = getattr(self.args, "actual_out", "")
+            self.done.emit(True, out)
         except BaseException as exc:
             self.log.emit("".join(traceback.format_exception(
                 type(exc), exc, exc.__traceback__)))
@@ -158,9 +164,18 @@ class SweepWindow(QWidget):
         self.ck_full.stateChanged.connect(self.update_projection)
         root.addWidget(self.ck_full)
         self.ck_export = QCheckBox(
-            "Export the palette (.pal), map (JSON), indexed PNG and .res of every "
-            "variant (export/<variant>/res)")
+            "Export the palette (.pal), map (JSON), indexed PNG and .res of EVERY "
+            "variant now (to export just one later, use the box at the bottom)")
         root.addWidget(self.ck_export)
+        self.ck_clean = QCheckBox(
+            "Shadow: clean the border of flat dark areas (one solid colour, no dotted halo)")
+        self.ck_clean.setChecked(True)
+        root.addWidget(self.ck_clean)
+        self.ck_contour = QCheckBox(
+            "Shadow: keep contours (doors, windows are not split between normal and "
+            "shadow; contour before colour)")
+        self.ck_contour.setChecked(True)
+        root.addWidget(self.ck_contour)
 
         self.lb_info = QLabel("Select the axes; the grid is generated in one run.")
         self.lb_info.setWordWrap(True)
@@ -181,6 +196,38 @@ class SweepWindow(QWidget):
         bt_row.addWidget(self.bt_open)
         bt_row.addStretch(1)
         root.addLayout(bt_row)
+
+        # v2.11: the files (.pal, map, .res) of ONE variant, picked after the
+        # sweep, instead of exporting every variant
+        exp = QGroupBox("Export one sample (palette .pal, map, .res, indexed PNG)")
+        el = QVBoxLayout(exp)
+        er = QHBoxLayout()
+        er.addWidget(QLabel("Sweep folder:"))
+        self.ed_sweep = QLineEdit()
+        self.ed_sweep.setPlaceholderText("filled after a sweep, or browse an older sweep folder")
+        self.ed_sweep.setAcceptDrops(False)
+        self.ed_sweep.textChanged.connect(self.load_variants)
+        er.addWidget(self.ed_sweep, 1)
+        bt_sw = QPushButton("Browse…")
+        bt_sw.clicked.connect(self.browse_sweep)
+        er.addWidget(bt_sw)
+        el.addLayout(er)
+        vr = QHBoxLayout()
+        self.cb_variant = QComboBox()
+        self.cb_variant.setToolTip("The name in brackets is the one written under each "
+                                   "picture in the gallery (sweep.html).")
+        vr.addWidget(self.cb_variant, 1)
+        self.bt_export1 = QPushButton("Export this one")
+        self.bt_export1.setEnabled(False)
+        self.bt_export1.clicked.connect(self.export_one)
+        vr.addWidget(self.bt_export1)
+        self.bt_files = QPushButton("Open its files")
+        self.bt_files.setEnabled(False)
+        self.bt_files.clicked.connect(self.open_files)
+        vr.addWidget(self.bt_files)
+        el.addLayout(vr)
+        root.addWidget(exp)
+        self.export_dir = ""
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -404,6 +451,8 @@ class SweepWindow(QWidget):
             dither_strength=",".join(strengths), modes=",".join(modes),
             palette_dither=self.paldith(), palette_rounds=2,
             export=self.ck_export.isChecked(), workers=self.sp_workers.value(),
+            shadow_dotted_edges=not self.ck_clean.isChecked(),
+            shadow_free_contours=not self.ck_contour.isChecked(),
             max_tiles=f"{self.ed_t1.text().strip()},{self.ed_t2.text().strip()}",
             cap_scope="auto", crop=None, full=self.ck_full.isChecked(), gain="auto",
             brightness=0.0, bg_color=None, no_pad=False, pad_color=None,
@@ -452,9 +501,72 @@ class SweepWindow(QWidget):
         if ok and out:
             self.bt_open.setEnabled(True)
             self.ed_out.setText(out)
+            self.ed_sweep.setText(out)
             self._log(f"\nsweep written to: {out}\n")
         else:
             self._log(f"\nsweep failed: {out}\n")
+
+    # ---------------- export of one variant
+    def browse_sweep(self):
+        p = QFileDialog.getExistingDirectory(self, "Sweep folder")
+        if p:
+            self.ed_sweep.setText(p)
+
+    def load_variants(self):
+        self.cb_variant.clear()
+        self.bt_export1.setEnabled(False)
+        folder = self.ed_sweep.text().strip()
+        if not folder or not os.path.isfile(os.path.join(folder, "sweep.json")):
+            if folder:
+                self.cb_variant.addItem("(no sweep.json in this folder)")
+            return
+        try:
+            _, meta = md.load_sweep(folder)
+        except BaseException as exc:
+            self.cb_variant.addItem(f"(could not read sweep.json: {exc})")
+            return
+        for v in meta.get("variants", []):
+            stem = md.variant_stem(v)
+            self.cb_variant.addItem(f"{md.variant_label(v)}   [{stem}]", stem)
+        self.bt_export1.setEnabled(self.cb_variant.count() > 0
+                                   and not (self.worker is not None and self.worker.isRunning()))
+
+    def export_one(self):
+        folder = self.ed_sweep.text().strip()
+        stem = self.cb_variant.currentData()
+        if not folder or not stem:
+            return
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Busy", "Wait for the running job to finish.")
+            return
+
+        def job():
+            exp_dir, same = md.export_one(folder, stem)
+            return exp_dir
+
+        self._log(f"\nexporting {stem}...\n")
+        self.bt_run.setEnabled(False)
+        self.bt_export1.setEnabled(False)
+        self.worker = _Worker(None, job)
+        self.worker.log.connect(self._log)
+        self.worker.done.connect(self._export_done)
+        self.worker.start()
+
+    def _export_done(self, ok, out):
+        self.bt_run.setEnabled(True)
+        self.bt_export1.setEnabled(True)
+        if ok and out:
+            self.export_dir = out
+            self.bt_files.setEnabled(True)
+            self._log(f"export written to: {out}\n")
+        else:
+            self._log(f"export failed: {out}\n")
+
+    def open_files(self):
+        if self.export_dir and os.path.isdir(self.export_dir):
+            res = os.path.join(self.export_dir, "res")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(res if os.path.isdir(res)
+                                                        else self.export_dir))
 
     def open_gallery(self):
         if not self.actual_out:

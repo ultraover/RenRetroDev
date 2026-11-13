@@ -25,7 +25,7 @@ One program, four tools, picked from a start screen:
 
 ## Quick start (Windows)
 
-1. Download `MD_Background_Tools.exe` from the [release page](https://github.com/ultraover/RenRetroDev/releases/tag/md-background-tools-v1.1).
+1. Download `MD_Background_Tools.exe` from the [release page](https://github.com/ultraover/RenRetroDev/releases/tag/md-background-tools-v1.2).
 2. Double-click it and pick a tool.
 3. In **Background · window**, drop an image, choose the options and press
    **Generate samples**. Compare the four samples, pick one, press **Export**.
@@ -58,6 +58,21 @@ default `res/` export folder and any error log in
   shadow together with the palettes, so the 15 colours can leave the darks to
   the shadow. It avoids an 8×8 mosaic on smooth areas and counts the darkened
   backdrop. The shadow is written into the map (the tile priority bit).
+  In your game, that priority bit also decides what is drawn in front: the
+  normal tiles are high priority, so give your sprites high priority too; the
+  shadow only shows where both planes are low priority; and on sprites, PAL3
+  colours 14 and 15 become highlight and shadow operators instead of colours.
+  `report.md` explains it next to the export.
+  A flat dark area ringed by bright detail (a pit next to rock) goes normal
+  on one solid colour, so its border shows no dotted halo. Both windows have a
+  checkbox for it; on the command line, `--shadow-edges dotted` (Background)
+  or `--shadow-dotted-edges` (Sweep) keeps the old way.
+  A flat shape with a sharp outline (a door in a dark wall) is never split
+  between normal and shadow tiles, so its outline stays; dark shapes go
+  shadow even when the colour is a little less exact (contour before colour).
+  Both windows have a "keep contours" checkbox; on the command line,
+  `--shadow-contours off` (Background) or `--shadow-free-contours` (Sweep)
+  lets each tile pick on its own again.
 - **Highlight:** on a plane, highlight needs sprites (PAL3 colour 14), so the tool
   only **measures** it. It reports how much it would help and how many sprites
   it would take against the VDP limits (80 per screen, 20 and 320 px per line),
@@ -73,7 +88,17 @@ default `res/` export folder and any error log in
 
 ## Output files
 
-For the exported sample (or every sweep variant with **Export**):
+For the exported sample, or for a sweep variant:
+
+- **Sweep, just the one you like:** each picture in `sweep.html` has its name
+  under it (`p1_floyd_balanced_t1150_shadow`). In the Sweep window, the box
+  **Export one sample** lists the variants of the last sweep (or of an older
+  sweep folder you browse to); pick one and press **Export this one**. The
+  variant is computed again from the options saved in `sweep.json`, checked
+  pixel by pixel against the gallery, and written to `export/<name>/res/`.
+  In the console, drag a sweep folder into the window and type its number.
+- **Every variant at once:** the checkbox "Export ... of EVERY variant" (or
+  `--export`) before the sweep.
 
 | File | Content |
 |---|---|
@@ -90,7 +115,11 @@ For the exported sample (or every sweep variant with **Export**):
 MD_Background_Tools.exe --run background-console sample --source pic.png --palettes 2 --dithering floyd --mode shadow --max-tiles 900 --cap-scope view --no-ask
 MD_Background_Tools.exe --run background-console emit --samples pic/samples.json --n 1 --name wall --res res/wall.res
 MD_Background_Tools.exe --run sweep-console sweep --source pic.png --palettes 1,2 --dithering none,floyd,riemersma --modes normal,shadow --max-tiles 900,700 --export
+MD_Background_Tools.exe --run sweep-console export --sweep sweep_pic --variant p1_floyd_balanced_t900_shadow
 ```
+
+`export --sweep <folder>` without `--variant` lists the variants with their
+numbers; `--variant` takes a name, a number or a comma list.
 
 Add `--help` after `sample` or `sweep` for every option. The sweep runs several
 variants at once on several CPU cores (`--workers N`; default: cores − 1, limited
