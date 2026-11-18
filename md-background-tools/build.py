@@ -20,7 +20,7 @@ def main():
            "--name", NAME, "--paths", SRC, "--distpath", DIST,
            "--workpath", os.path.join(HERE, "build"), "--specpath", os.path.join(HERE, "build")]
     for mod in ("md_color", "md_fundo_v2", "md_fundo_gui_v2", "md_fundo_sweep_v2",
-                "sweep_gui_v2", "scipy.ndimage"):
+                "sweep_gui_v2", "md_tile_editor", "scipy.ndimage"):
         cmd += ["--hidden-import", mod]
     cmd.append(os.path.join(SRC, "md_tools.py"))
     subprocess.check_call(cmd)

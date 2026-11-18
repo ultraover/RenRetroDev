@@ -43,6 +43,9 @@ Conventions
 - Question 6 asks whether the image is a background that scrolls; the answer
   suggests question 7 (resize): a scrolling plane follows the screen height
   (224), a still image follows the screen width (320). "none" keeps the pixels.
+  Any size works too: 400x (width 400, aspect ratio kept), x300 (height 300,
+  aspect kept) or 400x300 (both sides). Question 7b picks the method: nearest
+  (default, adds no colour), bilinear, bicubic, lanczos or area.
 - Question 8 asks for the maximum number of unique tiles the final image may
   have; every sample is cut to that ceiling (0 = no limit). The cap is a hard
   budget, so it wins over the recipe's own target. Question 8b asks where the
@@ -98,7 +101,8 @@ for _s in (sys.stdout, sys.stderr):
         except Exception:
             pass
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from md_color import MD_GRID_LAB, MD_GRID_RGB, rgb_to_lab  # noqa: E402
+from md_color import MD_GRID_RGB  # noqa: E402
+from md_color import rgb_to_lab as true_lab  # noqa: E402
 
 APP_NAME = "MD Background Tools"
 
@@ -165,6 +169,130 @@ HALFTONE4 = np.block([[2 * _CLUSTER2, 15 - 2 * _CLUSTER2],
 DAC15 = np.array([0, 29, 52, 70, 87, 101, 116, 130, 144, 158, 172, 187, 206, 228, 255],
                  dtype=np.float64)
 
+# --------------------------------------------------------------------------
+# how the conversion measures a colour (v2.14)
+# --------------------------------------------------------------------------
+# Every colour comparison of the conversion (the colour of a pixel, the palette
+# of a tile, the palettes made, the tile merge and the numbers reported) goes
+# through rgb_to_lab() below, so the choices and the measure always agree.
+#
+# Colour weight (0..1, 1 = plain Lab): the colour axes a*, b* are scaled by the
+# weight. Lower, a slightly tinted colour of the right lightness can win over a
+# grey of the wrong one. At 0 only the lightness counts. v2.13 weighted only
+# the choice of the pixel and still chose the palette of each tile by plain
+# Lab: at 0 nothing kept the colour in check and the tile choice then gave up
+# the lightness to save colour (an all-green floor on a dark grey cave).
+COLOR_WEIGHT = 1.0
+# Grey mode: a colour counts only as the grey a monochrome filter shows: the
+# MD levels as BlastEm 1.0 outputs them (read from its screenshots), weighted
+# by Rec.601 (0.299 R + 0.587 G + 0.114 B). Colours are free: any colour of the
+# right grey will do, so the picture only makes sense seen through the filter.
+GREY_MODE = False
+GREY_DAC15 = np.array([0, 27, 49, 71, 87, 103, 119, 130, 146, 157, 174, 190, 206, 228, 255],
+                      dtype=np.float64)
+GREY_FORMULA = np.array([0.299, 0.587, 0.114])
+_GREY_LUT = np.arange(256, dtype=np.float64)
+_GREY_LUT[DAC15.astype(int)] = GREY_DAC15
+
+
+def grey_value(rgb):
+    """The grey (0..255) a monochrome filter shows for each colour. MD output
+    values (normal, shadow and highlight steps) become the BlastEm ones; any
+    other value (a source pixel) is taken as it is."""
+    a = np.asarray(rgb, dtype=np.float64)
+    ai = np.clip(np.rint(a), 0, 255).astype(np.int64)
+    a = np.where(a == ai, _GREY_LUT[ai], a)
+    return a @ GREY_FORMULA
+
+
+def rgb_to_lab(rgb):
+    """Lab as the conversion measures it (see above)."""
+    if GREY_MODE:
+        y = grey_value(rgb)
+        lab = true_lab(np.stack([y, y, y], axis=-1))
+        lab[..., 1:] = 0.0
+        return lab
+    lab = true_lab(rgb)
+    if COLOR_WEIGHT != 1.0:
+        lab[..., 1:] *= COLOR_WEIGHT
+    return lab
+
+
+MD_GRID_LAB = rgb_to_lab(MD_GRID_RGB)
+
+
+def _measure_changed():
+    global MD_GRID_LAB
+    MD_GRID_LAB = rgb_to_lab(MD_GRID_RGB)
+
+
+def set_color_weight(w):
+    """Colour weight of the conversion, 0..1 (1 = normal)."""
+    global COLOR_WEIGHT
+    w = 1.0 if w is None else float(w)
+    if not 0.0 <= w <= 1.0:
+        raise SystemExit(f"colour weight {w}: use a value from 0 to 1 (1 = normal)")
+    COLOR_WEIGHT = w
+    _measure_changed()
+    return w
+
+
+def color_weight():
+    return COLOR_WEIGHT
+
+
+def set_grey_mode(on):
+    """Grey mode on or off (see above)."""
+    global GREY_MODE
+    if isinstance(on, str):
+        t = on.strip().lower()
+        if t in ("on", "yes", "1", "true", "grey", "gray"):
+            on = True
+        elif t in ("off", "no", "0", "false", "none", ""):
+            on = False
+        else:
+            raise SystemExit(f"grey mode {on!r}: use on or off")
+    GREY_MODE = bool(on)
+    _measure_changed()
+    return GREY_MODE
+
+
+def grey_mode():
+    return GREY_MODE
+
+
+# v2.16: preference between dots and solid colour, 0..1 (0.5 = normal, the
+# strength presets as they are). Above 0.5 a dither must win by more before it
+# draws dots; below, it dithers more readily. It scales, for every dither:
+#   ordered4/8, halftone, bluenoise: the grain cost and the dE under which a
+#     solid colour is kept without trying a mix (DITHER_STRENGTHS floor);
+#   ordered2: the margin the checker must win by (CHECKER_MARGIN), +-SOLID_SPAN;
+#   diffusions: how much of the error is spread (_diffusion_strength).
+# The error each pixel is left with follows it, so the palette of each tile is
+# chosen by the same preference.
+SOLID_PREF = 0.5
+SOLID_RANGE = 4.0     # factor on the grain cost at 0 (1/4) and at 1 (x4)
+SOLID_SPAN = 4.0      # dE added to the ordered2 margin from 0 to 1 (-2..+2)
+
+
+def set_solid_pref(p):
+    """Dots vs solid colour preference, 0..1 (0.5 = normal)."""
+    global SOLID_PREF
+    p = 0.5 if p is None else float(p)
+    if not 0.0 <= p <= 1.0:
+        raise SystemExit(f"solid preference {p}: use a value from 0 to 1 (0.5 = normal)")
+    SOLID_PREF = p
+    return p
+
+
+def solid_pref():
+    return SOLID_PREF
+
+
+def _solid_factor():
+    """1 at the normal preference, 1/SOLID_RANGE at 0, SOLID_RANGE at 1."""
+    return SOLID_RANGE ** ((SOLID_PREF - 0.5) * 2.0)
+
 try:  # optional: numba makes the error diffusion loops ~50x faster
     from numba import njit as _njit
 except Exception:  # pragma: no cover - plain Python fallback
@@ -204,8 +332,9 @@ def _blue_noise_matrix(n=16, sigma=1.5):
 BLUE16 = _blue_noise_matrix(16)
 
 MODES = ("normal", "shadow", "highlight", "both")
-DITHERS = ("none", "ordered4", "ordered8", "floyd", "atkinson", "stucki",
+DITHERS = ("none", "ordered2", "ordered4", "ordered8", "floyd", "atkinson", "stucki",
            "halftone", "bluenoise", "riemersma")
+# ordered2: Bayer 2x2 held at 50% - see _checker_mix. N colours give 2N-1 tones.
 
 # Fixed slot order: the number never moves, the letter is the recipe.
 LETTERS = "ABCD"
@@ -215,8 +344,13 @@ LETTERS = "ABCD"
 # color
 # --------------------------------------------------------------------------
 def lab_to_rgb(lab):
+    """RGB of a Lab point given in the measure of rgb_to_lab()."""
     lab = np.asarray(lab, dtype=np.float64)
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    if GREY_MODE or COLOR_WEIGHT == 0.0:
+        a, b = np.zeros_like(a), np.zeros_like(b)
+    elif COLOR_WEIGHT != 1.0:
+        a, b = a / COLOR_WEIGHT, b / COLOR_WEIGHT
     fy = (L + 16.0) / 116.0
     fx = fy + a / 500.0
     fz = fy - b / 200.0
@@ -306,25 +440,80 @@ RESIZE_W, RESIZE_H = 320, 224
 PLANE_MAX = 512          # the biggest plane is 64x64 tiles = 512x512 px
 
 
-def resize_to(rgb, how):
-    """Resize for the screen: 'width' -> 320 wide, 'height' -> 224 tall.
+# v2.12: the resize method is a choice. nearest is the default on purpose: it
+# never invents a colour and never blurs the pixels the palette will have to
+# carry. The others mix neighbours (smoother when shrinking a photo or a
+# painting, but they add in-between colours the palette has to absorb).
+RESIZE_METHODS = ("nearest", "bilinear", "bicubic", "lanczos", "area")
+_PIL_RESIZE = {"nearest": Image.NEAREST, "bilinear": Image.BILINEAR,
+               "bicubic": Image.BICUBIC, "lanczos": Image.LANCZOS, "area": Image.BOX}
+RESIZE_MAX = 4096
 
-    Nearest neighbour on purpose: it never invents a colour and never blurs the
-    pixels the palette will have to carry, which is what a tile conversion
-    wants. LANCZOS would mix neighbours and add colours that were not there.
+
+def parse_resize(how):
+    """(width, height) the image should have, or None for no resize.
+
+    'width' = 320 wide and 'height' = 224 tall (the old answers). 'WxH' sets
+    both sides (the aspect ratio is NOT kept); 'Wx' or 'xH' sets one side and
+    the other follows the aspect ratio. A side left out is None.
     """
-    if how in (None, "", "none"):
-        return rgb
+    t = str(how or "none").strip().lower().replace(" ", "").replace("*", "x")
+    if t in ("", "none", "no", "n", "0x0", "x"):
+        return None
+    if t == "width":
+        return (RESIZE_W, None)
+    if t == "height":
+        return (None, RESIZE_H)
+    m = re.fullmatch(r"(\d*)x(\d*)", t)
+    if not m:
+        raise SystemExit(f"unknown resize: {how} (use width, height, none, "
+                         "400x (width 400), x300 (height 300) or 400x300)")
+    w, h = (int(v) if v and int(v) else None for v in m.groups())
+    if w is None and h is None:
+        return None
+    for v in (w, h):
+        if v is not None and not 8 <= v <= RESIZE_MAX:
+            raise SystemExit(f"resize: each side from 8 to {RESIZE_MAX} px ({how})")
+    return (w, h)
+
+
+def resize_text(how):
+    """The answer written back, in the 'Wx' / 'xH' / 'WxH' / 'none' form."""
+    t = parse_resize(how)
+    if t is None:
+        return "none"
+    return f"{t[0] or ''}x{t[1] or ''}"
+
+
+def resize_size(w, h, how):
+    """The (width, height) the image will have after resize_to."""
+    t = parse_resize(how)
+    if t is None:
+        return w, h
+    tw, th = t
+    if tw and th:
+        return tw, th
+    if tw:
+        return tw, max(1, int(round(h * tw / w)))
+    return max(1, int(round(w * th / h))), th
+
+
+def resize_method(name):
+    m = str(name or "nearest").strip().lower()
+    if m not in _PIL_RESIZE:
+        raise SystemExit(f"unknown resize method: {name} ({', '.join(RESIZE_METHODS)})")
+    return m
+
+
+def resize_to(rgb, how, method="nearest"):
+    """Resize the picture: see parse_resize for 'how', RESIZE_METHODS for the
+    method (nearest by default, the only one that adds no colour)."""
     h, w = rgb.shape[:2]
-    if how == "width":
-        nw, nh = RESIZE_W, max(1, int(round(h * RESIZE_W / w)))
-    elif how == "height":
-        nh, nw = RESIZE_H, max(1, int(round(w * RESIZE_H / h)))
-    else:
-        raise SystemExit(f"unknown resize: {how}")
+    nw, nh = resize_size(w, h, how)
     if (nw, nh) == (w, h):
         return rgb
-    return np.asarray(Image.fromarray(rgb).resize((nw, nh), Image.NEAREST), np.uint8)
+    return np.asarray(Image.fromarray(rgb).resize((nw, nh), _PIL_RESIZE[resize_method(method)]),
+                      np.uint8)
 
 
 def pad8(rgb, fill=PAD_FILL):
@@ -351,6 +540,22 @@ def auto_gain(rgb):
     if p < 1:
         return 1.0
     return float(np.clip(230.0 / p, 1.0, 2.6))
+
+
+def parse_gain(text, rgb):
+    """Brightness gain from text: auto (measured on rgb), none (1.0) or a number."""
+    g = str(text if text is not None else "auto").strip().lower()
+    if g == "auto":
+        return auto_gain(rgb)
+    if g in ("none", "off", "no", ""):
+        return 1.0
+    try:
+        v = float(g.replace(",", "."))
+    except ValueError:
+        raise SystemExit(f"gain: auto, none or a number, not {text!r}")
+    if not 0.1 <= v <= 4.0:
+        raise SystemExit(f"gain {v}: use a number between 0.1 and 4")
+    return v
 
 
 def prepare(rgb, gain, brightness=0.0):
@@ -529,8 +734,8 @@ def key_mask(rgb, key, tol=KEY_TOLERANCE):
     exact = np.all(rgb == key.astype(np.uint8), axis=2)
     if tol <= 0:
         return exact
-    d = np.sqrt(dists(rgb_to_lab(rgb.reshape(-1, 3).astype(np.float64)),
-                      rgb_to_lab(key))[:, 0]).reshape(rgb.shape[:2])
+    d = np.sqrt(dists(true_lab(rgb.reshape(-1, 3).astype(np.float64)),
+                      true_lab(key))[:, 0]).reshape(rgb.shape[:2])
     return exact | (d <= tol)
 
 
@@ -736,6 +941,25 @@ DITHER_STRENGTHS = {"clean": (None, 10.0),
                     "full": (None, DITHER_FLOOR)}
 DITHER_DEFAULT = "balanced"
 
+# v2.15: weight of the grain of an ordered pattern against its mix error
+# (ordered4/8, halftone, bluenoise). 0 is the v2.14 behaviour; 1 would never
+# dither (the grain plus the mix error is the mean error of the pixels, never
+# below the solid colour). Tested on a city background: 0.15.
+GRAIN_COST = 0.15
+GRAIN_STRENGTH = {"clean": 2.0, "balanced": 1.0, "full": 0.6}
+
+# v2.16: the ordered dithers mix only NEIGHBOUR colours (Gabriel graph: no
+# other palette colour inside the sphere whose diameter is the pair). A pair
+# that skips over a colour in between (black and olive with a grey between
+# them, the dark sky inside a yellow moon) makes salt and pepper; the colour in
+# between and one of the two always land closer with less grain.
+ORDERED_NEIGHBOURS = True
+# v2.16: where the source is smooth (3x3 spread below this, dE) the target of
+# the ordered dithers is its 3x3 mean, so the brush texture of a painting does
+# not make the mix ratio jump from pixel to pixel and break the pattern into
+# noise. Edges and detail (spread above it) keep their own pixels. 0 = off.
+ORDERED_SMOOTH = 6.0
+
 
 def _ordered_mix(lab, lab_pal, shape, n, strength=DITHER_DEFAULT, matrix=None):
     """Ordered dither: per pixel, the PAIR whose mix lands closest to the target.
@@ -753,10 +977,42 @@ def _ordered_mix(lab, lab_pal, shape, n, strength=DITHER_DEFAULT, matrix=None):
     is a few percent - the further apart they are, the sooner it looks like
     dirt. SPECK_FLOOR is the absolute minimum and the preset raises it with the
     pair distance. When no pair qualifies, the solid nearest color wins.
+
+    v2.15: the pair is chosen by its mix error PLUS the grain it makes. Up to
+    v2.14 only the mix error counted, so on "full" a dark navy with 10-25% of
+    light tan dots won on a dark purple road (the mean was right) and the whole
+    image got a yellow drizzle (perceived error 17 against 5 now). The grain
+    of a pattern is t(1-t)|a-b|^2, the spread of its pixels around the mix;
+    GRAIN_COST weighs it, and a pair that costs more than the solid colour
+    loses to it.
+
+    v2.16: only neighbour colours pair up (ORDERED_NEIGHBOURS), and the
+    target is the 3x3 mean where the source is smooth (ORDERED_SMOOTH), so
+    the pattern stays whole instead of turning into noise.
     """
     sep_ref, floor = DITHER_STRENGTHS.get(strength, DITHER_STRENGTHS[DITHER_DEFAULT])
+    sf = _solid_factor()                 # v2.16: dots vs solid (see SOLID_PREF)
+    grain = GRAIN_COST * GRAIN_STRENGTH.get(strength, 1.0) * sf
+    floor = floor * np.sqrt(sf)
+    lab_pal = np.asarray(lab_pal, np.float64)
     k = len(lab_pal)
     ii, jj = np.triu_indices(k, 1)
+    if ORDERED_NEIGHBOURS and len(ii):
+        # v2.16: only pairs with no other colour of the palette between them
+        mid = (lab_pal[ii] + lab_pal[jj]) / 2.0
+        r2 = ((lab_pal[ii] - lab_pal[jj]) ** 2).sum(1) / 4.0
+        dm = ((mid[:, None, :] - lab_pal[None, :, :]) ** 2).sum(2)
+        ar = np.arange(len(ii))
+        dm[ar, ii] = np.inf
+        dm[ar, jj] = np.inf
+        near = dm.min(1) > r2
+        ii, jj = ii[near], jj[near]
+    if ORDERED_SMOOTH > 0 and lab.shape[0] == shape[0] * shape[1] > 1:
+        # v2.16: smooth target where the source is smooth (see ORDERED_SMOOTH)
+        img = np.asarray(lab, np.float64).reshape(shape[0], shape[1], 3)
+        mean = _box3(img)
+        spread = np.sqrt(np.maximum(_box3(img * img) - mean * mean, 0.0).sum(2))
+        lab = np.where((spread < ORDERED_SMOOTH)[..., None], mean, img).reshape(-1, 3)
     u = lab_pal[ii] - lab_pal[jj]
     b = lab_pal[jj]
     uu = (u * u).sum(1)
@@ -788,7 +1044,9 @@ def _ordered_mix(lab, lab_pal, shape, n, strength=DITHER_DEFAULT, matrix=None):
         t = np.clip((lu - bu) / uu, 0.0, 1.0)
         d2 = l2 - 2.0 * (lb + t * lu) + (bb + 2.0 * t * bu + t * t * uu)
         row = np.arange(len(sub))
-        order = np.argsort(d2, axis=1)[:, :FEW_PAIRS]
+        # v2.15: the grain of the pattern is a cost too (see GRAIN_COST)
+        cost = d2 + grain * t * (1.0 - t) * uu
+        order = np.argsort(cost, axis=1)[:, :FEW_PAIRS]
         pick = np.full(len(sub), -1, int)
         for c in range(order.shape[1]):
             cand = order[:, c]
@@ -797,6 +1055,8 @@ def _ordered_mix(lab, lab_pal, shape, n, strength=DITHER_DEFAULT, matrix=None):
             pick = np.where(ok, cand, pick)
         live = pick >= 0
         pick = np.maximum(pick, 0)
+        if grain > 0:
+            live &= cost[row, pick] < dd.min(1)     # the solid colour is cheaper
         tk = t[row, pick]
         mix = np.sqrt(np.maximum(d2[row, pick], 0.0))
         out = np.where(tk > thr[s:e], ii[pick], jj[pick])
@@ -805,6 +1065,57 @@ def _ordered_mix(lab, lab_pal, shape, n, strength=DITHER_DEFAULT, matrix=None):
         out = np.where(flat, solid, out)
         idx[s:e] = out
         err[s:e] = np.where(live & ~flat, mix, d0)
+    return idx.reshape(shape), err.reshape(shape)
+
+
+# ordered2: how much closer (dE) the 50% mix must be than the solid colour
+CHECKER_MARGIN = {"clean": 2.0, "balanced": 1.0, "full": 0.0}
+
+
+def _checker_mix(lab, lab_pal, shape, strength=DITHER_DEFAULT):
+    """ordered2: the 2x2 Bayer held at 50%, so N colours give 2N-1 tones.
+
+    The palette is put in order of lightness (L*, then a*, b*), and each
+    colour pairs only with its neighbour in that order. A pixel takes the
+    closest of the N solid colours and the N-1 midpoints between neighbours;
+    a midpoint is drawn as a 2x2 checkerboard of the two (the 2x2 Bayer at
+    50%: the pixels with even x + y take the darker one). There are no 25% or
+    75% mixes and no pairs of far colours, so the pattern stays one fine
+    checker. Made for palettes that climb in lightness (the ladder palettes
+    and grey mode); strength sets how much closer the mix must be than the
+    solid colour before the checker is used (CHECKER_MARGIN).
+    """
+    margin = CHECKER_MARGIN.get(strength, CHECKER_MARGIN[DITHER_DEFAULT])
+    margin += SOLID_SPAN * (SOLID_PREF - 0.5)     # v2.16: dots vs solid
+    lab_pal = np.asarray(lab_pal, np.float64)
+    order = np.lexsort((lab_pal[:, 2], lab_pal[:, 1], lab_pal[:, 0]))
+    ii, jj = order[:-1], order[1:]              # ii darker, jj lighter
+    keep = ((lab_pal[ii] - lab_pal[jj]) ** 2).sum(1) > 1e-9
+    ii, jj = ii[keep], jj[keep]
+    mids = (lab_pal[ii] + lab_pal[jj]) / 2.0
+    yy = np.arange(shape[0])[:, None]
+    xx = np.arange(shape[1])[None, :]
+    even = (((yy + xx) % 2) == 0).reshape(-1)
+    total = lab.shape[0]
+    idx = np.empty(total, np.uint8)
+    err = np.empty(total)
+    for s in range(0, total, 8192):
+        e = min(total, s + 8192)
+        sub = lab[s:e]
+        dd = dists(sub, lab_pal)
+        solid = dd.argmin(1)
+        d0 = np.sqrt(dd.min(1))
+        if len(mids):
+            dm = dists(sub, mids)
+            m = dm.argmin(1)
+            d1 = np.sqrt(dm.min(1))
+            use = d1 + margin < d0
+            pair = np.where(even[s:e], ii[m], jj[m])
+            idx[s:e] = np.where(use, pair, solid)
+            err[s:e] = np.where(use, d1, d0)
+        else:
+            idx[s:e] = solid
+            err[s:e] = d0
     return idx.reshape(shape), err.reshape(shape)
 
 
@@ -824,7 +1135,9 @@ STUCKI_KERNEL = (
 
 
 def _diffusion_strength(strength):
-    return {"clean": 0.65, "balanced": 0.85, "full": 1.0}.get(strength, 0.85)
+    s = {"clean": 0.65, "balanced": 0.85, "full": 1.0}.get(strength, 0.85)
+    # v2.16: dots vs solid (see SOLID_PREF): half the spread at 1, double at 0
+    return float(min(1.0, s / np.sqrt(_solid_factor())))
 
 
 FLOYD_KERNEL = ((1, 0, 7 / 16), (-1, 1, 3 / 16), (0, 1, 5 / 16), (1, 1, 1 / 16))
@@ -835,19 +1148,23 @@ FLOYD_KERNEL = ((1, 0, 7 / 16), (-1, 1, 3 / 16), (0, 1, 5 / 16), (1, 1, 1 / 16))
 # extreme colours (v1 behaviour on riemersma/stucki "full").
 DIFFUSE_MARGIN = 12.0
 
+# v2.13: weight of the colour against the lightness: see "how the conversion
+# measures a colour" at the top. The weight is already in the Lab values that
+# reach the dithers, so the kernels below take cw2 = 1.
+
 
 @_njit(cache=True)
-def _nearest(p0, p1, p2, pal):
+def _nearest(p0, p1, p2, pal, cw2):
     best, bi = 1e30, 0
     for i in range(pal.shape[0]):
-        d = (pal[i, 0] - p0) ** 2 + (pal[i, 1] - p1) ** 2 + (pal[i, 2] - p2) ** 2
+        d = (pal[i, 0] - p0) ** 2 + cw2 * ((pal[i, 1] - p1) ** 2 + (pal[i, 2] - p2) ** 2)
         if d < best:
             best, bi = d, i
     return bi
 
 
 @_njit(cache=True)
-def _diffuse_core(buf, pal, kern, strength, lo, hi):
+def _diffuse_core(buf, pal, kern, strength, lo, hi, cw2):
     h, w = buf.shape[0], buf.shape[1]
     out = np.zeros((h, w), np.uint8)
     for y in range(h):
@@ -859,7 +1176,7 @@ def _diffuse_core(buf, pal, kern, strength, lo, hi):
                     buf[y, x, c] = lo[c]
                 elif buf[y, x, c] > hi[c]:
                     buf[y, x, c] = hi[c]
-            i = _nearest(buf[y, x, 0], buf[y, x, 1], buf[y, x, 2], pal)
+            i = _nearest(buf[y, x, 0], buf[y, x, 1], buf[y, x, 2], pal, cw2)
             out[y, x] = i
             e0 = (buf[y, x, 0] - pal[i, 0]) * strength
             e1 = (buf[y, x, 1] - pal[i, 1]) * strength
@@ -890,7 +1207,7 @@ def _diffuse(lab_flat, lab_pal, shape, kernel, strength=0.85):
     pal = np.ascontiguousarray(lab_pal, np.float64)
     lo, hi = _bounds(pal)
     kern = np.asarray(kernel, np.float64)
-    return _diffuse_core(buf, pal, kern, float(strength), lo, hi)
+    return _diffuse_core(buf, pal, kern, float(strength), lo, hi, 1.0)
 
 
 def _hilbert_order(shape):
@@ -924,7 +1241,7 @@ RIEMERSMA_RATIO = 1.0 / 16.0   # weight of the oldest entry vs the newest
 
 
 @_njit(cache=True)
-def _riemersma_core(lab, order, pal, weights, strength, lo, hi):
+def _riemersma_core(lab, order, pal, weights, strength, lo, hi, cw2):
     n = order.shape[0]
     q = weights.shape[0]
     queue = np.zeros((q, 3))
@@ -943,7 +1260,7 @@ def _riemersma_core(lab, order, pal, weights, strength, lo, hi):
             elif v > hi[c]:
                 v = hi[c]
             p[c] = v
-        i = _nearest(p[0], p[1], p[2], pal)
+        i = _nearest(p[0], p[1], p[2], pal, cw2)
         out[f] = i
         head = (head - 1) % q
         for c in range(3):
@@ -968,7 +1285,8 @@ def _riemersma(lab_flat, lab_pal, shape, strength=0.85, queue_len=RIEMERSMA_QUEU
     weights = r ** np.arange(queue_len)
     weights = weights / weights.sum()
     lo, hi = _bounds(pal)
-    return _riemersma_core(lab, order, pal, weights, float(strength), lo, hi).reshape(h, w)
+    return _riemersma_core(lab, order, pal, weights, float(strength), lo, hi,
+                           1.0).reshape(h, w)
 
 
 def _box3(img):
@@ -1003,7 +1321,9 @@ def _paint_lab_err(lab, lab_pal, shape, mode, strength=DITHER_DEFAULT):
         i0 = dd.argmin(1)
         return i0.reshape(shape), np.sqrt(dd[row, i0]).reshape(shape)
     ordered = None
-    if mode.startswith("ordered"):
+    if mode == "ordered2":
+        ordered = _checker_mix(lab, lab_pal, shape, strength)
+    elif mode.startswith("ordered"):
         ordered = _ordered_mix(lab, lab_pal, shape, 4 if mode.endswith("4") else 8,
                                strength)
     elif mode == "halftone":
@@ -1153,8 +1473,42 @@ def set_view_height(px):
     WIN_H = px // 8
 
 
+# v2.14: scroll margin. A game that scrolls pixel by pixel shows, between two
+# tile steps, part of one more tile column (41) and one more tile row: all of
+# them are in VRAM at once. On, the per-view cap counts the windows one tile
+# wider and taller (on an axis no longer than the view, nothing changes).
+SCROLL_MARGIN = 0
+
+
+def set_scroll_margin(on):
+    """Scroll margin on or off (see above). Returns the state."""
+    global SCROLL_MARGIN
+    if isinstance(on, str):
+        t = on.strip().lower()
+        if t in ("on", "yes", "1", "true"):
+            on = True
+        elif t in ("off", "no", "0", "false", "none", ""):
+            on = False
+        else:
+            raise SystemExit(f"scroll margin {on!r}: use on or off")
+    SCROLL_MARGIN = 1 if on else 0
+    return bool(SCROLL_MARGIN)
+
+
+def scroll_margin():
+    return bool(SCROLL_MARGIN)
+
+
 def view_label():
+    if SCROLL_MARGIN:
+        return f"{(WIN_W + 1) * 8}x{(WIN_H + 1) * 8} (320x{WIN_H * 8} + scroll margin)"
     return f"320x{WIN_H * 8}"
+
+
+def view_height_px():
+    """The view height in use (224 or 240). Modules that star-import this one
+    must call it: their own WIN_H is a copy taken at import time."""
+    return WIN_H * 8
 WIN_STEP = 1                 # one tile = 8 px per slide, both axes
 
 
@@ -1165,7 +1519,7 @@ def windows_of(nh, nw):
     never leaves the image: the last origin is nh - WIN_H / nw - WIN_W. On an
     axis smaller than the window the whole axis is used (a single position).
     """
-    ww, wh = min(WIN_W, nw), min(WIN_H, nh)
+    ww, wh = min(WIN_W + SCROLL_MARGIN, nw), min(WIN_H + SCROLL_MARGIN, nh)
     for y0 in range(0, nh - wh + 1, WIN_STEP):
         for x0 in range(0, nw - ww + 1, WIN_STEP):
             yield x0, x0 + ww, y0, y0 + wh
@@ -1517,14 +1871,28 @@ def reduce_tiles_windows(idx, pals, tile_pal, budget, seed=0, space_w=100.0):
                     bi = int(ins[c])
                     if not np.isfinite(sub[r, c]):
                         continue
+                    # v2.12: the DIRECTION (which of the two is replaced) is
+                    # chosen by the total damage, cost per use x uses. The per
+                    # use mean alone let a clean tile used 41 times be replaced
+                    # by a dotted one used 3 times, again and again, until one
+                    # dotted tile was repeated 54 times: a grid of black dots
+                    # on a flat grey (a distant plane). The ranking among pairs
+                    # still uses the per use cost, so rare details are not the
+                    # first thing destroyed (the v1 problem).
+                    opts = []
                     for x, y in ((r, int(c)), (int(c), r)):   # both directions
+                        if not np.isfinite(sub[x, y]):
+                            continue
                         a, b = int(cand[ins[x]]), int(cand[ins[y]])
                         f = int(subf[x, y])
                         pa = int(pal_mode[a])
                         raw = float(((feat(a, 0, pa) - feat(b, f, pa)) ** 2).sum())
                         pen = float(sub[x, y]) - raw   # key/edge/space/palette
-                        cost = ((group_cost(a, b, f) + pen) * float(importance[a])
-                                * (1.0 + 0.05 * np.log1p(float(cnt[a]))))
+                        per_use = (group_cost(a, b, f) + pen) * float(importance[a])
+                        cost = per_use * (1.0 + 0.05 * np.log1p(float(cnt[a])))
+                        opts.append((per_use * float(cnt[a]), cost, a, b, f))
+                    if opts:
+                        _, cost, a, b, f = min(opts)
                         if best_p is None or cost < best_p[0]:
                             best_p = (cost, a, b, f)
                 if best_p is not None:
@@ -2601,6 +2969,107 @@ def load_palette(path):
     return snap_md(colors.astype(np.float64))
 
 
+def palette_colors(path):
+    """Every colour of one palette file, in order (up to 64), as RGB uint8.
+
+    .pal: JASC-PAL or plain "R G B" lines (other lines are skipped).
+    .png: an indexed PNG gives its palette entries; any other PNG gives its
+    pixels row by row when it has at most 64 of them (a 16x1 or 16x4 strip),
+    else its distinct colours in the order they first appear."""
+    if not os.path.isfile(path):
+        raise SystemExit(f"palette file not found: {path}")
+    if path.lower().endswith(".png"):
+        with Image.open(path) as im:
+            if im.mode == "P":
+                raw = im.getpalette() or []
+                used = int(np.asarray(im).max()) + 1 if im.size[0] * im.size[1] else 0
+                cols = np.array(raw, np.uint8).reshape(-1, 3)
+                # Pillow pads some palettes to 256 entries: keep what the
+                # pixels use, or the whole stored palette when it is short
+                n = len(cols) if len(cols) <= 64 else max(used, 1)
+                cols = cols[:n]
+            else:
+                px = np.asarray(im.convert("RGB")).reshape(-1, 3)
+                if len(px) <= 64:
+                    cols = px
+                else:
+                    _, first = np.unique(px, axis=0, return_index=True)
+                    cols = px[np.sort(first)]
+    else:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = [l.strip() for l in fh if l.strip()]
+        count = None
+        if lines and lines[0].upper() == "JASC-PAL":
+            # header: JASC-PAL, version, number of colours
+            if len(lines) > 2 and lines[2].isdigit():
+                count = int(lines[2])
+            lines = lines[3:]
+        rows = []
+        for line in lines:
+            parts = line.replace(",", " ").replace(";", " ").split()
+            try:
+                vals = [float(p) for p in parts[:3]]
+            except ValueError:
+                continue
+            if len(vals) == 3 and all(0 <= v <= 255 for v in vals):
+                rows.append([int(round(v)) for v in vals])
+        if count is not None:
+            rows = rows[:count]
+        cols = np.array(rows, np.uint8).reshape(-1, 3)
+    if len(cols) == 0:
+        raise SystemExit(f"no colours found in the palette file: {path}")
+    if len(cols) > 64:
+        raise SystemExit(f"{path}: {len(cols)} colours; the Mega Drive has 4 "
+                         "palettes of 16 (64 colours at most)")
+    return np.asarray(cols, np.uint8)
+
+
+def palette_file_list(text):
+    """The files of a palette option: one path, or several separated by ';'."""
+    if text is None:
+        return []
+    if isinstance(text, (list, tuple)):
+        items = list(text)
+    else:
+        items = str(text).split(";")
+    return [p.strip().strip('"') for p in items if p and p.strip().strip('"')]
+
+
+def load_palette_set(text, key):
+    """Fixed palettes from one or more files (v2.13, for the sweep).
+
+    Every file is cut in blocks of 16 colours, each block is one palette.
+    In a block of 16, colour 0 is the backdrop slot (transparent on the MD):
+    it is replaced by the backdrop the conversion uses, and colours 1..15 are
+    the palette. A shorter block (a file with 15 colours or fewer) has only
+    colours: they go to 1..n and the last one fills the free slots. Colours
+    are moved to the nearest Mega Drive colour. Returns (palettes, notes)."""
+    files = palette_file_list(text)
+    if not files:
+        return None, []
+    chave = np.asarray(key if key is not None else (0, 0, 0), np.uint8).reshape(1, 3)
+    pals, notes = [], []
+    for f in files:
+        cols = palette_colors(f)
+        snapped = snap_md(cols.astype(np.float64).reshape(1, -1, 3))[0]
+        moved = int((snapped != cols).any(1).sum())
+        blocks = [snapped[i:i + 16] for i in range(0, len(snapped), 16)]
+        desc = []
+        for b in blocks:
+            body = b[1:] if len(b) == 16 else b
+            body = np.vstack([body] + [body[-1:]] * (15 - len(body)))
+            pals.append(np.vstack([chave, body[:15]]).astype(np.uint8))
+            desc.append("16 (colour 0 = backdrop)" if len(b) == 16 else f"{len(b)}")
+        notes.append(f"{os.path.basename(f)}: {len(cols)} colours -> "
+                     f"{len(blocks)} palette{'s' if len(blocks) > 1 else ''} "
+                     f"({', '.join(desc)})"
+                     + (f"; {moved} moved to the nearest MD colour" if moved else ""))
+    if len(pals) > 4:
+        raise SystemExit(f"{len(pals)} palettes in the palette file(s); the Mega "
+                         "Drive has 4")
+    return pals, notes
+
+
 # --------------------------------------------------------------------------
 # comparison sheet
 # --------------------------------------------------------------------------
@@ -2702,7 +3171,7 @@ def empty_profile():
             "preferences": {"palettes": 1, "palette_file": None, "mode": "normal",
                             "transparency": False, "dithering": "ordered4",
                             "dither_strength": DITHER_DEFAULT,
-                            "scroll": False, "resize": "none", "max_tiles": None, "cap_scope": "image", "oversize": "resize", "shadow_clean": True, "shadow_contour": True,
+                            "scroll": False, "resize": "none", "resize_method": "nearest", "max_tiles": None, "cap_scope": "image", "oversize": "resize", "shadow_clean": True, "shadow_contour": True,
                             "recipe": "fidelity", "lambda": 0.35, "vq": None}}
 
 
@@ -2755,7 +3224,9 @@ def ask(args, profile):
             "dither_strength": (getattr(args, "dither_strength", None)
                                 or stored.get("dither_strength", DITHER_DEFAULT)),
             "scroll": (args.scroll == "yes") if getattr(args, "scroll", None) else stored["scroll"],
-            "resize": args.resize or stored["resize"],
+            "resize": resize_text(args.resize or stored["resize"]),
+            "resize_method": resize_method(getattr(args, "resize_method", None)
+                                           or stored.get("resize_method", "nearest")),
             "max_tiles": (args.max_tiles if getattr(args, "max_tiles", None) is not None
                           else stored.get("max_tiles")),
             "cap_scope": (getattr(args, "cap_scope", None)
@@ -2862,8 +3333,10 @@ def ask(args, profile):
     if n > 4:
         raise SystemExit("1 to 4 palettes.")
 
+    method = "nearest"
     if getattr(args, "cmd", "sample") != "sample":
         scroll, resize = stored["scroll"], stored["resize"]
+        method = stored.get("resize_method", "nearest")
     else:
         if getattr(args, "scroll", None):
             scroll = args.scroll == "yes"
@@ -2872,11 +3345,26 @@ def ask(args, profile):
             scroll = _ask("6) Background that scrolls (a plane that pans)?", "n", ["y", "n"]) == "y"
         hint = "height" if scroll else "width"
         if getattr(args, "resize", None):
-            resize = args.resize
+            resize = resize_text(args.resize)
             print(f"7) resize: {resize} (from the command line)")
         else:
-            resize = _ask("7) Resize: width 320, height 224 or none?", hint,
-                          ["width", "height", "none"])
+            while True:
+                txt = _ask("7) Resize: width (320 wide), height (224 tall), none, or a size:"
+                           " 400x = width 400 keeping the aspect ratio, x300 = height 300"
+                           " keeping it, 400x300 = both sides (aspect not kept)", hint)
+                try:
+                    resize = resize_text(txt)
+                    break
+                except SystemExit as exc:
+                    print(f"  invalid answer: {exc}")
+        if resize != "none":
+            if getattr(args, "resize_method", None):
+                method = resize_method(args.resize_method)
+                print(f"7b) resize method: {method} (from the command line)")
+            else:
+                method = _ask("7b) Resize method: nearest (keeps the pixels, adds no colour)"
+                              " or an interpolation (smoother, adds in-between colours)?",
+                              "nearest", list(RESIZE_METHODS))
 
     max_tiles = None
     if getattr(args, "cmd", "sample") == "sample":
@@ -2915,8 +3403,8 @@ def ask(args, profile):
 
     return {"palettes": n, "palette_file": palette_file, "mode": mode,
             "transparency": trans, "dithering": dith, "dither_strength": dst,
-            "scroll": scroll, "resize": resize, "max_tiles": max_tiles,
-            "cap_scope": cap_scope, "backdrop": backdrop, "backdrop_rgb": backdrop_rgb,
+            "scroll": scroll, "resize": resize, "resize_method": method,
+            "max_tiles": max_tiles, "cap_scope": cap_scope, "backdrop": backdrop, "backdrop_rgb": backdrop_rgb,
             "shadow_clean": shadow_clean, "shadow_contour": shadow_contour}
 
 
@@ -2982,14 +3470,15 @@ def segments_of(h, w, limit=PLANE_MAX):
     return [(x0, x1, y0, y1) for (y0, y1) in cuts(h) for (x0, x1) in cuts(w)]
 
 
-def scale_to_fit(rgb, limit=PLANE_MAX):
-    """Shrink to the biggest plane, with nearest neighbour (no invented colours)."""
+def scale_to_fit(rgb, limit=PLANE_MAX, method="nearest"):
+    """Shrink to the biggest plane (nearest by default: no invented colours)."""
     h, w = rgb.shape[:2]
     if max(h, w) <= limit:
         return rgb
     f = limit / max(h, w)
     nw, nh = max(8, int(round(w * f))), max(8, int(round(h * f)))
-    return np.asarray(Image.fromarray(rgb).resize((nw, nh), Image.NEAREST), np.uint8)
+    return np.asarray(Image.fromarray(rgb).resize((nw, nh), _PIL_RESIZE[resize_method(method)]),
+                      np.uint8)
 
 
 def apply_pad(rgb, a):
@@ -3126,6 +3615,7 @@ def run_samples(rgb, resp, a, folder, title, export_name=None):
 
 def cmd_sample(a):
     set_view_height(int(getattr(a, "view_height", None) or 224))
+    set_scroll_margin(getattr(a, "scroll_margin", None) or False)
     profile = load_profile()
     bg = parse_fill(getattr(a, "bg_color", None))
     rgb0 = load(a.source, bg)
@@ -3139,11 +3629,34 @@ def cmd_sample(a):
 
     resp = ask(a, profile)
     resize_note = ""
-    if resp.get("resize") in ("width", "height"):
-        rgb0 = resize_to(rgb0, resp["resize"])
+    resp["resize"] = resize_text(resp.get("resize"))
+    resp["resize_method"] = resize_method(resp.get("resize_method"))
+    # v2.13: colour weight of the dither choice (window option; 1 = normal)
+    cw_arg = getattr(a, "color_weight", None)
+    resp["color_weight"] = set_color_weight(cw_arg if cw_arg is not None
+                                            else resp.get("color_weight", 1.0))
+    if resp["color_weight"] != 1.0:
+        print(f"note: colour weight {resp['color_weight'] * 100:.0f}% (colour against "
+              "lightness)")
+    # v2.16: dots vs solid colour preference (window option; 0.5 = normal)
+    sp_arg = getattr(a, "solid", None)
+    resp["solid_pref"] = set_solid_pref(sp_arg if sp_arg is not None
+                                        else resp.get("solid_pref", 0.5))
+    if resp["solid_pref"] != 0.5:
+        print(f"note: solid colour preference {resp['solid_pref'] * 100:.0f}% "
+              "(50% = normal; higher draws fewer dots)")
+    gm_arg = getattr(a, "grey", None)
+    resp["grey_mode"] = set_grey_mode(gm_arg if gm_arg is not None
+                                      else resp.get("grey_mode", False))
+    if resp["grey_mode"]:
+        print("note: GREY MODE - colours count only as the grey a monochrome filter "
+              "shows (BlastEm levels, Rec.601); view the result through the filter")
+    if resp["resize"] != "none":
+        rgb0 = resize_to(rgb0, resp["resize"], resp["resize_method"])
         h1, w1 = rgb0.shape[:2]
         if (w1, h1) != (w0, h0):
-            resize_note = f"  \u00b7  resized {w0}x{h0} -> {w1}x{h1} ({resp['resize']})"
+            resize_note = (f"  \u00b7  resized {w0}x{h0} -> {w1}x{h1}"
+                           f" ({resp['resize']}, {resp['resize_method']})")
     rgb0, pad_note = apply_pad(rgb0, a)
     if rgb0.shape[0] % 8 or rgb0.shape[1] % 8:
         raise SystemExit(f"image sides must be multiples of 8: {rgb0.shape[1]}x{rgb0.shape[0]}")
@@ -3169,20 +3682,21 @@ def cmd_sample(a):
             plane_note = (f"  \u00b7  kept at {rgb0.shape[1]}x{rgb0.shape[0]}, over the"
                           " 512x512 plane limit (the ROM has to deal with it)")
         else:
-            rgb0 = scale_to_fit(rgb0)
+            rgb0 = scale_to_fit(rgb0, method=resp["resize_method"])
             rgb0, pad_note = apply_pad(rgb0, a)
             plane_note = f"  \u00b7  shrunk to {rgb0.shape[1]}x{rgb0.shape[0]} (plane limit)"
 
-    gain = auto_gain(rgb0) if getattr(a, "gain", "auto") in (None, "auto") else float(a.gain)
+    gain = parse_gain(getattr(a, "gain", "auto"), rgb0)
     rgb = prepare(rgb0, gain, float(getattr(a, "brightness", 0) or 0))
     resp["gain"] = gain
     resp["brightness"] = float(getattr(a, "brightness", 0) or 0)
 
     print(f"\nsource: {os.path.basename(a.source)}  {rgb0.shape[1]}x{rgb0.shape[0]}  \u00b7  "
           f"gain x{gain:.2f}{alpha_note}{resize_note}{plane_note}{pad_note}")
-    if resp.get("resize") == "height" and rgb0.shape[1] < RESIZE_W:
+    wanted = parse_resize(resp["resize"])
+    if wanted and wanted[0] is None and rgb0.shape[1] < RESIZE_W:
         print(f"warning: {rgb0.shape[1]} px wide, narrower than the screen ({RESIZE_W})")
-    if resp.get("resize") == "width" and rgb0.shape[0] > RESIZE_H:
+    if wanted and wanted[1] is None and rgb0.shape[0] > RESIZE_H:
         print(f"warning: {rgb0.shape[0]} px tall, taller than the screen ({RESIZE_H});"
               " needs a vertical scroll or a crop")
     # index 0 is always the backdrop: one colour, shared by every palette.
@@ -3194,6 +3708,7 @@ def cmd_sample(a):
         chave = border_key(rgb)
     # the source colour finds the backdrop pixels; the snapped one goes to CRAM
     resp["view_height"] = WIN_H * 8
+    resp["scroll_margin"] = scroll_margin()
     resp["key_src"] = [int(v) for v in np.asarray(chave).reshape(-1)[:3]]
     if resp.get("backdrop") == "color" and resp.get("backdrop_rgb"):
         resp["key_holes"] = True    # the author chose the colour: keep the holes
@@ -3284,6 +3799,7 @@ def cmd_choose(a):
     p["dither_strength"] = data["answers"].get("dither_strength", DITHER_DEFAULT)
     p["scroll"] = data["answers"].get("scroll", False)
     p["resize"] = data["answers"].get("resize", "none")
+    p["resize_method"] = data["answers"].get("resize_method", "nearest")
     p["max_tiles"] = data["answers"].get("max_tiles")
     p["cap_scope"] = data["answers"].get("cap_scope", "image")
     p["oversize"] = data["answers"].get("oversize", "resize")
@@ -3323,6 +3839,7 @@ def do_emit(path, name, res, resp, n_arg=None):
     """
     data = json.load(open(path, encoding="utf-8"))
     set_view_height(int(data.get("answers", {}).get("view_height") or 240))
+    set_scroll_margin(data.get("answers", {}).get("scroll_margin") or False)
     if n_arg:
         n = parse_choice(n_arg)
         chosen = data["samples"][n - 1]
@@ -4037,6 +4554,303 @@ def selftest():
     print(f"ok {ok}: a flat shape with an outline is never split between normal and "
           "shadow (dark goes shadow, bright takes the cheaper state)")
 
+    # 23. v2.12 resize: one side keeps the aspect ratio, two sides do not;
+    # nearest adds no colour, an interpolation may
+    assert resize_text("width") == "320x" and resize_text("height") == "x224"
+    assert resize_text("none") == "none" and resize_text("0x0") == "none"
+    assert resize_text("400 X 300") == "400x300" and resize_text("x300") == "x300"
+    assert resize_size(640, 448, "320x") == (320, 224)
+    assert resize_size(640, 448, "x112") == (160, 112)
+    assert resize_size(640, 448, "100x100") == (100, 100)
+    for bad in ("abc", "4x", "x99999"):
+        try:
+            parse_resize(bad)
+        except SystemExit:
+            continue
+        raise AssertionError(f"resize {bad} should be refused")
+    stripes = np.zeros((16, 16, 3), np.uint8)
+    stripes[:, ::2] = 255
+    n0 = len(np.unique(resize_to(stripes, "24x", "nearest").reshape(-1, 3), axis=0))
+    n1 = len(np.unique(resize_to(stripes, "24x", "bilinear").reshape(-1, 3), axis=0))
+    assert resize_to(stripes, "24x").shape == (24, 24, 3)
+    assert n0 == 2 and n1 > 2, (n0, n1)
+    ok += 1
+    print(f"ok {ok}: resize keeps the aspect ratio with one side, nearest adds no colour")
+
+    # 24. v2.12 tile cut: a clean tile used many times is never replaced by a
+    # rare dotted one (the per use cost alone did it, and the dotted tile,
+    # repeated everywhere, drew a grid of black dots on a flat grey)
+    # 6 flat columns on the left; 1 to 3 black dots on every tile on the
+    # right. The dotted tiles merge among themselves first (they are close in
+    # the picture), then the group meets the flat tile: v2.11 dirtied all 48.
+    rng = np.random.default_rng(0)
+    nh, nw, split = 8, 16, 6
+    tiles = np.full((nh, nw, 8, 8), 2, np.uint8)
+    for ty in range(nh):
+        for tx in range(split, nw):
+            for _ in range(rng.integers(1, 4)):
+                tiles[ty, tx, rng.integers(8), rng.integers(8)] = 1
+    idx = tiles.transpose(0, 2, 1, 3).reshape(nh * 8, nw * 8)
+    pal = np.zeros((16, 3), np.uint8)
+    pal[2] = (52, 52, 52)
+    out, _ = reduce_tiles_windows(idx, [pal], np.zeros((nh, nw), np.int32), 6, 0)
+    got = out.reshape(nh, 8, nw, 8).transpose(0, 2, 1, 3)
+    assert (got[:, :split] == 2).all(), "a clean tile used many times went dotted"
+    assert len(dedup(to_tiles(out))[0]) <= 6
+    ok += 1
+    print(f"ok {ok}: the tile cut keeps a clean tile used many times (no dotted grid)")
+
+    # 25. v2.13 palette file for the sweep: 16 colours per palette, colour 0
+    # is the backdrop slot; a short file has only colours; 5 palettes refused
+    import tempfile
+    cols = MD_GRID_RGB[np.linspace(0, len(MD_GRID_RGB) - 1, 32).astype(int)].astype(np.uint8)
+    with tempfile.TemporaryDirectory() as td:
+        p32 = os.path.join(td, "a.pal")
+        with open(p32, "w") as f:
+            f.write("JASC-PAL\n0100\n32\n" + "\n".join(" ".join(str(v) for v in c)
+                                                      for c in cols))
+        p5 = os.path.join(td, "b.pal")
+        with open(p5, "w") as f:
+            f.write("\n".join(" ".join(str(v) for v in c) for c in cols[:5]))
+        key = (0, 0, 255)
+        ps, _ = load_palette_set(p32, key)
+        assert len(ps) == 2 and all(p.shape == (16, 3) for p in ps)
+        assert (ps[0][0] == key).all() and (ps[1][1:] == cols[17:]).all()
+        ps, _ = load_palette_set(p5, key)
+        assert (ps[0][1:6] == cols[:5]).all() and (ps[0][6:] == cols[4]).all()
+        assert len(load_palette_set(f"{p32};{p5}", key)[0]) == 3
+        try:
+            load_palette_set(f"{p32};{p32};{p5}", key)
+            raise AssertionError("5 palettes accepted")
+        except SystemExit:
+            pass
+    ok += 1
+    print(f"ok {ok}: palette files give 16-colour palettes with the backdrop at 0")
+
+    # 26. v2.13 colour weight: at 100% a grey ramp never takes a near-grey;
+    # lower, it does, and the tint the eye sees after the mix stays small
+    ramp = np.repeat(np.linspace(40, 200, 96)[None, :], 32, 0)
+    ramp = np.repeat(ramp[..., None], 3, 2).astype(np.uint8)
+    pal_t = np.array([(v, v, v) for v in (52, 87, 116, 144, 172, 206)]
+                     + [(144, 172, 172), (172, 144, 144), (87, 116, 116), (116, 87, 87)],
+                     np.float64)
+    tinted = lambda i: int((i >= 6).sum())   # noqa: E731
+
+    def lab_pair():
+        return rgb_to_lab(ramp.reshape(-1, 3).astype(np.float64)), rgb_to_lab(pal_t)
+
+    try:
+        set_color_weight(1.0)
+        n1 = tinted(floyd(*lab_pair(), ramp.shape[:2]))
+        set_color_weight(0.3)
+        i3 = floyd(*lab_pair(), ramp.shape[:2])
+    finally:
+        set_color_weight(1.0)
+    shown = true_lab(pal_t[i3].reshape(-1, 3)).reshape(32, 96, 3)
+    left = np.hypot(*np.moveaxis(_box3(shown)[..., 1:], -1, 0))
+    assert n1 == 0 and tinted(i3) > 0, (n1, tinted(i3))
+    assert float(left.mean()) < 3.0, float(left.mean())
+    for bad in (-0.1, 1.5):
+        try:
+            set_color_weight(bad)
+            raise AssertionError(f"colour weight {bad} accepted")
+        except SystemExit:
+            pass
+    set_color_weight(1.0)
+    ok += 1
+    print(f"ok {ok}: colour weight lets near-greys in only below 100%")
+
+    # 27. v2.14 colour weight 0 and grey mode, on a flat dark grey with a
+    # ladder of 4 palettes by grey (saturated darks, as in a real ladder): the
+    # floor stays dark. v2.13 at 0% chose the tiles by plain Lab and turned it
+    # into a light green.
+    flat = np.full((32, 64, 3), 30, np.uint8)
+    flat[:, 32:] = 90
+    lad = [np.array([(0, 0, 0)] + [tuple(int(v) for v in c) for c in p]
+                    + [tuple(int(v) for v in p[-1])] * (15 - len(p)), np.uint8)
+           for p in ([(0, 0, 52), (0, 0, 87), (52, 0, 0), (52, 0, 52), (52, 52, 52),
+                      (0, 52, 0), (52, 0, 87), (87, 0, 52)],
+                     [(87, 87, 87), (0, 87, 87), (87, 52, 87), (116, 87, 87),
+                      (87, 116, 87), (116, 116, 116), (0, 144, 52), (116, 87, 144)])]
+    try:
+        for cw, gm in ((0.0, False), (1.0, True)):
+            set_color_weight(cw)
+            set_grey_mode(gm)
+            r = dict(palettes=2, palette_file=None, transparency=False, dithering="floyd",
+                     dither_strength="balanced", cap_scope="image", key=None,
+                     key_holes=False, mode="normal")
+            idx, tp, _ = assign_palettes(flat, lad, r)
+            rows = np.repeat(np.repeat(tp, 8, 0), 8, 1)
+            out = np.asarray(lad, np.uint8)[rows, idx]
+            g = grey_value(out) if gm else true_lab(out.reshape(-1, 3).astype(
+                np.float64))[:, 0].reshape(out.shape[:2]) * 2.55
+            want = grey_value(flat) if gm else true_lab(flat.reshape(-1, 3).astype(
+                np.float64))[:, 0].reshape(flat.shape[:2]) * 2.55
+            err = float(np.abs(_box3(g[..., None])[..., 0] - _box3(want[..., None])[..., 0]).mean())
+            assert err < 6.0, (cw, gm, err)
+        assert abs(float(grey_value(np.array([52, 52, 52]))) - 49) < 1e-9
+        assert abs(float(grey_value(np.array([50, 50, 50]))) - 50) < 1e-9
+        for bad in ("maybe",):
+            try:
+                set_grey_mode(bad)
+                raise AssertionError("bad grey mode accepted")
+            except SystemExit:
+                pass
+    finally:
+        set_color_weight(1.0)
+        set_grey_mode(False)
+    ok += 1
+    print(f"ok {ok}: colour weight 0 and grey mode keep the lightness")
+
+    # 28. v2.14 scroll margin: the per-view windows grow one tile on each axis
+    # that is longer than the view, and only there
+    try:
+        for vh in (224, 240):
+            set_view_height(vh)
+            for margin in (False, True):
+                set_scroll_margin(margin)
+                m = 1 if margin else 0
+                ws = list(windows_of(60, 80))
+                assert {(x1 - x0, y1 - y0) for x0, x1, y0, y1 in ws} == {(40 + m, vh // 8 + m)}
+                assert len(ws) == (60 - vh // 8 - m + 1) * (80 - 40 - m + 1)
+                ws = list(windows_of(100, 40))          # a 320 px wide image
+                assert {(x1 - x0, y1 - y0) for x0, x1, y0, y1 in ws} == {(40, vh // 8 + m)}
+                ws = list(windows_of(vh // 8, 40))      # exactly one screen
+                assert len(ws) == 1
+        assert "scroll margin" in view_label()
+        try:
+            set_scroll_margin("maybe")
+            raise AssertionError("bad scroll margin accepted")
+        except SystemExit:
+            pass
+    finally:
+        set_scroll_margin(False)
+        set_view_height(224)
+    ok += 1
+    print(f"ok {ok}: scroll margin counts one more tile row and column per view")
+
+    # 29. ordered2: the 2x2 Bayer at 50% gives exactly 2N-1 tones on a ramp,
+    # only between neighbours in lightness, always as a checkerboard
+    greys = np.array([[v, v, v] for v in LEVELS], np.uint8)          # N = 8
+    # 64 flat steps 4 px wide, so every 2x2 cell has one target
+    ramp = np.repeat(np.repeat(np.linspace(0, 255, 64), 4)[None, :], 16, 0)
+    ramp = np.repeat(ramp[..., None], 3, 2)
+    lab_r = rgb_to_lab(ramp.reshape(-1, 3))
+    i2, e2 = _paint_lab_err(lab_r, rgb_to_lab(greys.astype(np.float64)), ramp.shape[:2],
+                            "ordered2", "full")
+    tones = set()
+    for x in range(0, 256, 2):
+        cell = i2[0:2, x:x + 2]
+        a, b = int(cell[0, 0]), int(cell[0, 1])
+        a, b = min(a, b), max(a, b)
+        assert b - a <= 1, ("only neighbours mix", x, a, b)
+        assert cell[0, 0] == cell[1, 1] and cell[0, 1] == cell[1, 0]
+        tones.add((a, b))
+    assert len(tones) == 2 * len(greys) - 1, sorted(tones)
+    assert np.isfinite(e2).all()
+    # strength "clean" asks for a bigger gain, so it never checkers more
+    i3, _ = _paint_lab_err(lab_r, rgb_to_lab(greys.astype(np.float64)), ramp.shape[:2],
+                           "ordered2", "clean")
+    mixed = lambda ii: int((ii[:, 1:] != ii[:, :-1]).sum())
+    assert mixed(i3) <= mixed(i2)
+    ok += 1
+    print(f"ok {ok}: ordered2 gives {len(tones)} tones from {len(greys)} greys (2N-1)")
+
+    # 30. v2.15 grain cost of the ordered dithers: the dark purple road of
+    # a city background with a palette of dark navy, light tan and a blue grey. Without
+    # the cost, "full" drew the road as navy with tan dots (the yellow drizzle)
+    global GRAIN_COST, ORDERED_NEIGHBOURS
+    road = np.full((32, 32, 3), (52, 38, 65), np.float64)
+    pal_r = np.array([[0, 0, 52], [206, 172, 116], [52, 52, 87]], np.float64)
+    lab_road, lab_pr = rgb_to_lab(road.reshape(-1, 3)), rgb_to_lab(pal_r)
+    keep_cost, keep_nb = GRAIN_COST, ORDERED_NEIGHBOURS
+    try:
+        tan = {}
+        for cost in (0.0, keep_cost):
+            GRAIN_COST = cost
+            ORDERED_NEIGHBOURS = cost > 0      # the v2.14 behaviour had all pairs
+            for mode in ("ordered4", "ordered8", "halftone", "bluenoise"):
+                i_r, _ = _paint_lab_err(lab_road, lab_pr, (32, 32), mode, "full")
+                tan[(cost, mode)] = float((i_r == 1).mean())
+    finally:
+        GRAIN_COST, ORDERED_NEIGHBOURS = keep_cost, keep_nb
+    for mode in ("ordered4", "ordered8", "halftone", "bluenoise"):
+        assert tan[(0.0, mode)] > 0.05, ("the old drizzle", mode, tan)
+        assert tan[(keep_cost, mode)] == 0.0, ("no tan dots on the road", mode, tan)
+    ok += 1
+    print(f"ok {ok}: ordered dithers pay for their grain (tan dots on the road: "
+          f"{100 * tan[(0.0, 'ordered4')]:.0f}% before, 0% now)")
+
+    # 31. v2.16 neighbour pairs: a neutral grey with black, a warm grey and
+    # white. Black and white mix exactly to it, but the warm grey sits between
+    # them, so the pair is black dots in white (salt and pepper). Only
+    # neighbours may pair now: no black pixel on the flat grey.
+    flat = np.full((32, 32, 3), 150.0)
+    pal_n = np.array([[0, 0, 0], [116, 116, 87], [255, 255, 255]], np.float64)
+    lab_f, lab_pn = rgb_to_lab(flat.reshape(-1, 3)), rgb_to_lab(pal_n)
+    keep_cost, keep_nb = GRAIN_COST, ORDERED_NEIGHBOURS
+    try:
+        black = {}
+        GRAIN_COST = 0.0                   # the pair choice alone
+        for nb in (False, True):
+            ORDERED_NEIGHBOURS = nb
+            for mode in ("ordered4", "ordered8", "halftone", "bluenoise"):
+                i_n, _ = _paint_lab_err(lab_f, lab_pn, (32, 32), mode, "full")
+                black[(nb, mode)] = float((i_n == 0).mean())
+    finally:
+        GRAIN_COST, ORDERED_NEIGHBOURS = keep_cost, keep_nb
+    for mode in ("ordered4", "ordered8", "halftone", "bluenoise"):
+        assert black[(False, mode)] > 0.05, ("all pairs: black dots", mode, black)
+        assert black[(True, mode)] == 0.0, ("neighbours: no black", mode, black)
+    # ... and the smooth target: a flat area with a faint brush texture keeps
+    # one mix ratio, so the pattern repeats instead of drifting
+    rng = np.random.default_rng(1)
+    brush = np.clip(flat + rng.normal(0, 1.5, flat.shape), 0, 255)
+    lab_b = rgb_to_lab(brush.reshape(-1, 3))
+    i_b, _ = _paint_lab_err(lab_b, lab_pn, (32, 32), "ordered4", "full")
+    i_f, _ = _paint_lab_err(lab_f, lab_pn, (32, 32), "ordered4", "full")
+    drift = float((i_b != i_f).mean())
+    assert drift < 0.05, ("brush texture moved the pattern", drift)
+    ok += 1
+    print(f"ok {ok}: ordered dithers mix neighbours only (black dots: "
+          f"{100 * black[(False, 'ordered4')]:.0f}% before, 0% now; "
+          f"pattern drift on a brushed flat area {100 * drift:.0f}%)")
+
+    # 32. v2.16 solid preference: a soft grey ramp with three greys. Higher
+    # preference = fewer pixels off their nearest solid colour, for the
+    # ordered dithers, ordered2 and the diffusions; 0.5 = the presets as they are
+    ramp_g = np.repeat(np.linspace(60, 200, 64)[None, :, None], 32, 0).repeat(3, 2)
+    lab_g = rgb_to_lab(ramp_g.reshape(-1, 3))
+    pal_g = rgb_to_lab(np.array([[52, 52, 52], [116, 116, 116], [206, 206, 206]],
+                                np.float64))
+    near = dists(lab_g, pal_g).argmin(1).reshape(32, 64)
+    dots = {}
+    try:
+        for sp in (0.0, 0.5, 1.0):
+            set_solid_pref(sp)
+            for mode in ("ordered4", "ordered2", "bluenoise", "floyd"):
+                i_g, _ = _paint_lab_err(lab_g, pal_g, (32, 64), mode, "balanced")
+                dots[(sp, mode)] = float((i_g != near).mean())
+    finally:
+        set_solid_pref(0.5)
+    for mode in ("ordered4", "ordered2", "bluenoise", "floyd"):
+        assert dots[(0.0, mode)] >= dots[(0.5, mode)] >= dots[(1.0, mode)], (mode, dots)
+        assert dots[(0.0, mode)] > dots[(1.0, mode)], ("the preference does something",
+                                                       mode, dots)
+    for bad in (-0.1, 1.5):
+        try:
+            set_solid_pref(bad)
+            raise AssertionError(("accepted", bad))
+        except SystemExit:
+            pass
+    set_solid_pref(0.5)
+    ok += 1
+    print(f"ok {ok}: solid preference trades dots for solid colour (ordered4 dots "
+          f"{100 * dots[(0.0, 'ordered4')]:.0f}% / {100 * dots[(0.5, 'ordered4')]:.0f}% / "
+          f"{100 * dots[(1.0, 'ordered4')]:.0f}%, floyd "
+          f"{100 * dots[(0.0, 'floyd')]:.0f}% / {100 * dots[(0.5, 'floyd')]:.0f}% / "
+          f"{100 * dots[(1.0, 'floyd')]:.0f}% at 0, 50, 100%)")
+
     print(f"\n{ok}/{ok} tests passed")
     return 0
 
@@ -4130,7 +4944,20 @@ def main():
                        help="do not pad the image to multiples of 8")
         p.add_argument("--pad-color", help="RRGGBB of the padded border (default FFFFFF)")
         p.add_argument("--scroll", choices=("yes", "no"))
-        p.add_argument("--resize", choices=("width", "height", "none"))
+        p.add_argument("--resize", help="width (320 wide), height (224 tall), none,"
+                       " 400x (width 400, aspect kept), x300 (height 300, aspect kept)"
+                       " or 400x300 (both sides)")
+        p.add_argument("--resize-method", choices=RESIZE_METHODS,
+                       help="nearest (default, adds no colour) or an interpolation")
+        p.add_argument("--color-weight", type=float,
+                       help="colour weight vs lightness, 0..1 (default 1 = normal; "
+                            "0 = lightness only)")
+        p.add_argument("--solid", type=float,
+                       help="dots vs solid colour, 0..1 (default 0.5 = normal; "
+                            "higher draws fewer dots, lower dithers more)")
+        p.add_argument("--grey", choices=("on", "off"),
+                       help="grey mode: measure only the grey a monochrome filter "
+                            "shows (BlastEm levels, Rec.601)")
         p.add_argument("--bg-color", help="RRGGBB behind the alpha channel (default FFFFFF)")
         p.add_argument("--oversize", choices=("split", "resize", "none"),
                        help="what to do when a side is over the 512 px plane limit")
@@ -4138,6 +4965,9 @@ def main():
                        help="cap the unique tiles of every sample (0 = no limit)")
         p.add_argument("--view-height", type=int, choices=(224, 240), default=224,
                        help="height of one view for the per-view cap: 224 NTSC, 240 PAL")
+        p.add_argument("--scroll-margin", choices=("on", "off"),
+                       help="per-view cap counts one more tile row and column, "
+                            "the ones a pixel-by-pixel scroll shows")
         p.add_argument("--cap-scope", choices=("image", "view"),
                        help="does the tile cap apply to the whole image"
                             " or to each 320x240 view")

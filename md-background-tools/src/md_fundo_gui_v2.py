@@ -235,6 +235,142 @@ class PaletteStrip(QWidget):
 # --------------------------------------------------------------------------
 # options window
 # --------------------------------------------------------------------------
+class ResizeBox(QWidget):
+    """v2.12: resize of the source. Width and height in px (0 = auto); with
+    "keep aspect ratio" only one side is typed and the other follows it.
+    value() is the core's text ('none', '400x', 'x300', '400x300')."""
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.src_w = self.src_h = 0
+        self._busy = False
+        g = QGridLayout(self)
+        g.setContentsMargins(0, 0, 0, 0)
+        self.ck_on = QCheckBox("resize the image")
+        g.addWidget(self.ck_on, 0, 0, 1, 2)
+        self.sp_w = QSpinBox()
+        self.sp_h = QSpinBox()
+        for sp, tip in ((self.sp_w, "width in pixels"), (self.sp_h, "height in pixels")):
+            sp.setRange(0, md.RESIZE_MAX)
+            sp.setSingleStep(8)
+            sp.setSpecialValueText("auto")
+            sp.setSuffix(" px")
+            sp.setToolTip(tip + " (auto = follows the aspect ratio)")
+        g.addWidget(QLabel("width"), 1, 0)
+        g.addWidget(self.sp_w, 1, 1)
+        g.addWidget(QLabel("height"), 2, 0)
+        g.addWidget(self.sp_h, 2, 1)
+        self.ck_keep = QCheckBox("keep aspect ratio")
+        self.ck_keep.setToolTip("Type only the width or only the height; "
+                                "the other side follows the picture.")
+        self.ck_keep.setChecked(True)
+        g.addWidget(self.ck_keep, 3, 0, 1, 2)
+        g.addWidget(QLabel("method"), 4, 0)
+        self.cb_method = QComboBox()
+        for text, key, tip in (
+                ("nearest neighbor", "nearest",
+                 "Copies the nearest pixel: sharp, adds no colour (pixel art)."),
+                ("bilinear", "bilinear", "Averages 2x2 pixels: smooth."),
+                ("bicubic", "bicubic", "Smooth, a little sharper than bilinear."),
+                ("lanczos", "lanczos", "The sharpest of the smooth ones."),
+                ("area (box)", "area", "Averages every pixel it covers: "
+                                       "best to shrink a photo or a painting.")):
+            self.cb_method.addItem(text, key)
+            self.cb_method.setItemData(self.cb_method.count() - 1, tip, Qt.ToolTipRole)
+        self.cb_method.setToolTip("nearest adds no colour; the others are smoother "
+                                  "but add in-between colours the palette has to absorb")
+        g.addWidget(self.cb_method, 4, 1)
+        g.setColumnStretch(1, 1)
+        self.lb_size = QLabel("")
+        self.lb_size.setStyleSheet("color:#8a8")
+        g.addWidget(self.lb_size, 5, 0, 1, 2)
+        self.ck_on.toggled.connect(self._update)
+        self.ck_keep.toggled.connect(self._keep_toggled)
+        self.sp_w.valueChanged.connect(lambda v: self._side(self.sp_h, v))
+        self.sp_h.valueChanged.connect(lambda v: self._side(self.sp_w, v))
+        self.cb_method.currentIndexChanged.connect(self._update)
+        self._update()
+
+    def _side(self, other, v):
+        # keep aspect ratio: a typed side makes the other one "auto"
+        if not self._busy and v and self.ck_keep.isChecked() and other.value():
+            self._busy = True
+            other.setValue(0)
+            self._busy = False
+        self._update()
+
+    def _keep_toggled(self, on):
+        if on and self.sp_w.value() and self.sp_h.value():
+            self._busy = True
+            self.sp_h.setValue(0)
+            self._busy = False
+        self._update()
+
+    def set_size(self, w, h, on=True):
+        self._busy = True
+        self.ck_on.setChecked(on)
+        if w and h:
+            self.ck_keep.setChecked(False)
+        self.sp_w.setValue(w or 0)
+        self.sp_h.setValue(h or 0)
+        self._busy = False
+        self._update()
+
+    def set_source_size(self, w, h):
+        # only the label changes: no "changed" signal (the sweep window would
+        # measure the picture again and again)
+        self.src_w, self.src_h = w or 0, h or 0
+        busy, self._busy = self._busy, True
+        self._update()
+        self._busy = busy
+
+    MIN_SIDE = 8
+
+    def _sides(self):
+        # a side under 8 px is not a size yet (the first digit of "320"):
+        # it counts as auto until the number is complete
+        w, h = self.sp_w.value(), self.sp_h.value()
+        return (w if w >= self.MIN_SIDE else 0), (h if h >= self.MIN_SIDE else 0)
+
+    def value(self):
+        w, h = self._sides()
+        if not self.ck_on.isChecked() or (not w and not h):
+            return "none"
+        return f"{w or ''}x{h or ''}"
+
+    def method(self):
+        return self.cb_method.currentData() or "nearest"
+
+    def set_method(self, m):
+        i = self.cb_method.findData(m)
+        if i >= 0:
+            self.cb_method.setCurrentIndex(i)
+
+    def _update(self, *_):
+        on = self.ck_on.isChecked()
+        for wdg in (self.sp_w, self.sp_h, self.ck_keep, self.cb_method):
+            wdg.setEnabled(on)
+        v = self.value()
+        short = any(0 < s.value() < self.MIN_SIDE for s in (self.sp_w, self.sp_h))
+        try:
+            if not on:
+                self.lb_size.setText("the image keeps its size")
+            elif short:
+                self.lb_size.setText(f"each side needs at least {self.MIN_SIDE} px")
+            elif v == "none":
+                self.lb_size.setText("type a width or a height")
+            elif self.src_w and self.src_h:
+                nw, nh = md.resize_size(self.src_w, self.src_h, v)
+                self.lb_size.setText(f"{self.src_w}x{self.src_h} -> {nw}x{nh} px")
+            else:
+                self.lb_size.setText("")
+        except BaseException as exc:      # never close the window over a label
+            self.lb_size.setText(f"invalid size: {exc}")
+        if not self._busy:
+            self.changed.emit()
+
+
 class OptionsWindow(QWidget):
     def __init__(self, main):
         super().__init__(main, Qt.Tool)
@@ -312,6 +448,11 @@ class OptionsWindow(QWidget):
         f = QFormLayout(g)
         self.cb_dith = QComboBox()
         self.cb_dith.addItems(md.DITHERS)
+        self.cb_dith.setItemData(md.DITHERS.index("ordered2"),
+                                 "Bayer 2x2 held at 50%: each colour mixes only with its "
+                                 "neighbour in lightness, as a fine checkerboard. N colours "
+                                 "give 2N-1 tones (ladder palettes, grey mode).",
+                                 Qt.ToolTipRole)
         f.addRow("Type", self.cb_dith)
         self.cb_dst = QComboBox()
         self.cb_dst.addItems(list(md.DITHER_STRENGTHS))
@@ -324,12 +465,13 @@ class OptionsWindow(QWidget):
         g = QGroupBox("Image")
         f = QFormLayout(g)
         self.ck_scroll = QCheckBox("scrolling background")
+        # a scrolling plane follows the screen height, a still image its width
         self.ck_scroll.toggled.connect(
-            lambda s: self.cb_resize.setCurrentText("height" if s else "width"))
+            lambda s: self.rs.set_size(0, md.RESIZE_H) if s else self.rs.set_size(md.RESIZE_W, 0))
         f.addRow("Scroll", self.ck_scroll)
-        self.cb_resize = QComboBox()
-        self.cb_resize.addItems(["width", "height", "none"])
-        f.addRow("Resize", self.cb_resize)
+        self.rs = ResizeBox()
+        self.rs.set_size(md.RESIZE_W, 0)
+        f.addRow("Resize", self.rs)
         self.cb_over = QComboBox()
         self.cb_over.addItems(["resize", "split", "none"])
         f.addRow("Over 512 px", self.cb_over)
@@ -348,6 +490,36 @@ class OptionsWindow(QWidget):
         self.sp_bright = QDoubleSpinBox()
         self.sp_bright.setRange(-100, 100)
         f.addRow("Brightness", self.sp_bright)
+        self.sp_cweight = QSpinBox()
+        self.sp_cweight.setRange(0, 100)
+        self.sp_cweight.setSingleStep(5)
+        self.sp_cweight.setValue(100)
+        self.sp_cweight.setSuffix(" %")
+        self.sp_cweight.setToolTip(
+            "Colour weight vs lightness, in every colour comparison of the\n"
+            "conversion. 100% = normal, 0% = lightness only. Lower lets slightly\n"
+            "tinted colours of the right lightness in (smoother tones, fewer dots).")
+        f.addRow("Colour weight", self.sp_cweight)
+        self.sp_solid = QSpinBox()
+        self.sp_solid.setRange(0, 100)
+        self.sp_solid.setSingleStep(5)
+        self.sp_solid.setValue(50)
+        self.sp_solid.setSuffix(" %")
+        self.sp_solid.setToolTip(
+            "Dots against solid colour, for every dither (ordered and diffusion).\n"
+            "50% = normal (the strength preset as it is). Higher: a dither must win\n"
+            "by more before it draws dots, and the diffusions spread less error\n"
+            "(smoother, flatter). Lower: dithers more readily (more tones, more\n"
+            "grain). The palette of each tile follows the same preference.")
+        f.addRow("Solid vs dots", self.sp_solid)
+        self.ck_grey = QCheckBox("grey mode (monochrome filter)")
+        self.ck_grey.setToolTip(
+            "Every colour counts only as the grey a monochrome filter shows:\n"
+            "the MD levels as BlastEm outputs them, weighted by Rec.601\n"
+            "(0.299 R + 0.587 G + 0.114 B). Any colour of the right grey will\n"
+            "do, so the result looks odd in colour: view it through the filter.")
+        self.ck_grey.toggled.connect(lambda s: self.sp_cweight.setEnabled(not s))
+        f.addRow("", self.ck_grey)
         self.ck_pad = QCheckBox("pad to multiples of 8")
         self.ck_pad.setChecked(True)
         f.addRow("", self.ck_pad)
@@ -369,6 +541,13 @@ class OptionsWindow(QWidget):
         self.cb_view = QComboBox()
         self.cb_view.addItems(["320×224 (NTSC)", "320×240 (PAL)"])
         f.addRow("Screen view", self.cb_view)
+        self.ck_margin = QCheckBox("scroll margin (+1 tile row and column)")
+        self.ck_margin.setToolTip(
+            "Count one more tile row and column in every view: a game that\n"
+            "scrolls pixel by pixel shows part of 41 columns and 29 (NTSC) or\n"
+            "31 (PAL) rows at once, and all of them must be in VRAM.\n"
+            "Only on an axis longer than the view.")
+        f.addRow("", self.ck_margin)
         self.sp_seed = QSpinBox()
         self.sp_seed.setRange(0, 9999)
         f.addRow("Seed", self.sp_seed)
@@ -450,7 +629,11 @@ class OptionsWindow(QWidget):
             "dithering": self.cb_dith.currentText(),
             "dither_strength": self.cb_dst.currentText(),
             "scroll": self.ck_scroll.isChecked(),
-            "resize": self.cb_resize.currentText(),
+            "resize": self.rs.value(),
+            "resize_method": self.rs.method(),
+            "color_weight": self.sp_cweight.value() / 100.0,
+            "solid_pref": self.sp_solid.value() / 100.0,
+            "grey_mode": self.ck_grey.isChecked(),
             "max_tiles": None if mx == 0 else max(8, mx),
             "cap_scope": "view" if self.cb_scope.currentIndex() == 1 else "image",
             "backdrop": "color" if fixed else "border",
@@ -793,15 +976,18 @@ class CompareWindow(QMainWindow):
         o.bt_generate.setEnabled(True)
         self.images = [rgb, None, None, None, None]
         self.tile_pals = [None] * 5
+        o.rs.set_source_size(rgb.shape[1], rgb.shape[0])
         self.setWindowTitle(f"MD Background Tools · Background · {os.path.basename(path)}")
         o.lb_pre.setText("measuring colors and tiles…")
         self.refresh()
         self.fit()
         self.show_options()
         vh = o.view_height()
+        margin = o.ck_margin.isChecked()
 
         def pre():
             md.set_view_height(vh)
+            md.set_scroll_margin(margin)
             return md.preflight(rgb)
 
         self.run(pre, self._preflight_done)
@@ -852,8 +1038,8 @@ class CompareWindow(QMainWindow):
         try:
             src = md.load(self.data["source"], md.parse_fill(self.opts.bt_bg.property("hex")))
             ans = self.data.get("answers", {})
-            if ans.get("resize") in ("width", "height"):
-                src = md.resize_to(src, ans["resize"])
+            if ans.get("resize", "none") != "none":
+                src = md.resize_to(src, ans["resize"], ans.get("resize_method", "nearest"))
             if segment:
                 seg = next(s for s in json.load(open(os.path.join(os.path.dirname(folder),
                                                                    "split.json"),
@@ -894,7 +1080,7 @@ class CompareWindow(QMainWindow):
             brightness=o.sp_bright.value(), no_pad=not o.ck_pad.isChecked(),
             pad_color=o.bt_pad.property("hex"), bg_color=o.bt_bg.property("hex"),
             oversize=o.cb_over.currentText(), samples=None, name=None, res=None, n=None,
-            view_height=o.view_height())
+            view_height=o.view_height(), scroll_margin=o.ck_margin.isChecked())
 
         def work():
             old = md.ask

@@ -160,19 +160,23 @@ def _write_sweep_html(out, meta, rgb):
     pan = meta.get("pan", meta.get("width", 0) > 320 or meta.get("height", 0) > 224)
     modes = meta["modes"]
     palettes = meta["palettes"]
+    base_seed = int((meta.get("args") or {}).get("seed") or 0)
+    seeds = meta.get("seeds") or [base_seed]
+    rows_of = [(m, sd) for m in modes for sd in seeds]
     crop = meta["crop"]
     cap_scope = meta.get("cap_scope", "view")
     unit = "total" if cap_scope == "image" else "peak"
     tables = []
     for vq in budgets:
-        by_key = {(v["palettes"], v.get("max_tiles"), v["column"], v["mode"]): v
+        by_key = {(v["palettes"], v.get("max_tiles"), v["column"], v["mode"],
+                   v.get("seed", base_seed)): v
                   for v in meta["variants"] if v.get("max_tiles") == vq}
         rows = []
         for n in palettes:
-            for mi, mode in enumerate(modes):
+            for mi, (mode, sd) in enumerate(rows_of):
                 cells = []
                 for col in columns:
-                    v = by_key[(n, vq, col, mode)]
+                    v = by_key[(n, vq, col, mode, sd)]
                     href = v["full"] or v["thumb"]
                     src = href
                     cap = " CAP!" if not v["cap_ok"] else ""
@@ -195,9 +199,10 @@ def _write_sweep_html(out, meta, rgb):
                         f'{shadow_hl_html(v)}'
                         f'<br><span class="nm">{html.escape(variant_stem(v))}</span>'
                         f'</div></td>')
-                label = (f'<th class="pal" rowspan="{len(modes)}">{n} palette'
+                label = (f'<th class="pal" rowspan="{len(rows_of)}">{n} palette'
                          f'{"s" if n > 1 else ""}</th>' if mi == 0 else "")
-                rows.append(f'<tr>{label}<th class="mode">{html.escape(mode)}</th>'
+                mode_txt = html.escape(mode) + (f"<br>seed {sd}" if len(seeds) > 1 else "")
+                rows.append(f'<tr>{label}<th class="mode">{mode_txt}</th>'
                             + "".join(cells) + "</tr>")
         header = "".join(f"<th>{html.escape(c)}</th>" for c in columns)
         unit_label = ("max tiles total" if cap_scope == "image"
@@ -227,10 +232,25 @@ def _write_sweep_html(out, meta, rgb):
                f"variants · {meta['seconds']}s · crop x={crop[0]} y={crop[1]} "
                f"{crop[2]}x{crop[3]} · "
                f"{'pan background' if pan else 'static image'}")
+    if meta.get("resize", "none") != "none":
+        summary += f" · resized {meta['resize']} ({meta.get('resize_method', 'nearest')})"
+    summary += f" · brightness gain x{float(meta.get('gain') or 1):.2f}"
+    if float(meta.get("color_weight", 1.0)) != 1.0:
+        summary += f" · colour weight {float(meta['color_weight']) * 100:.0f}%"
+    if float(meta.get("solid_pref", 0.5)) != 0.5:
+        summary += f" · solid colour preference {float(meta['solid_pref']) * 100:.0f}%"
+    if meta.get("scroll_margin"):
+        summary += " · tile cap with scroll margin (+1 tile row and column)"
+    if meta.get("grey_mode"):
+        summary += (" · <b>grey mode</b> (measured as the grey a monochrome filter "
+                    "shows: view it through the filter)")
+    if meta.get("palette_file"):
+        summary += " · palettes from " + html.escape(
+            "; ".join(os.path.basename(p) for p in meta["palette_file"]))
     warn = ""
     if meta["width"] > 512 or meta["height"] > 512:
         warn = ("<p class=\"warn\">WARNING: the image is above 512x512. "
-                "No resize and no split: the plane limit is ignored.</p>")
+                "No split: the plane limit is ignored.</p>")
     ref_full = os.path.join(out, "reference_full.png")
     ref_src = "reference_full.png" if os.path.exists(ref_full) else "reference.png"
     full_note = ("" if meta.get("full_images") else
@@ -278,6 +298,68 @@ for (const v of views) {{
     open(os.path.join(out, "sweep.html"), "w", encoding="utf-8").write(doc)
 
 
+# v2.16: what to do over the 512 px plane (same choices as the Background tool)
+OVERSIZE = ("none", "resize", "split")
+
+
+def parse_segment(text):
+    """'x,y,w,h' (pixels of the prepared image) -> tuple, or None."""
+    if text in (None, "", "none"):
+        return None
+    try:
+        v = tuple(int(p) for p in str(text).replace(" ", "").split(","))
+    except ValueError:
+        v = ()
+    if len(v) != 4 or v[0] < 0 or v[1] < 0 or v[2] < 8 or v[3] < 8 \
+            or any(p % 8 for p in v):
+        raise SystemExit(f"segment {text!r}: use x,y,w,h in multiples of 8")
+    return v
+
+
+def _sweep_split(a, w, h):
+    """One sweep per segment of an image over the plane limit.
+
+    The cuts are the Background tool's (segments_of: as few pieces as fit,
+    as even as they can be, on multiples of 8). Each segment is a sweep of its
+    own, in its own folder, with the gain, backdrop and transparency of the
+    whole image; split.json and split.html list them."""
+    base_name = os.path.splitext(os.path.basename(a.source))[0]
+    raw_out = os.path.normpath(a.out or os.path.join(os.getcwd(), f"sweep_{base_name}"))
+    out = (raw_out if os.path.abspath(raw_out) == os.getcwd()
+           else make_unique_dir(raw_out))
+    os.makedirs(out, exist_ok=True)
+    segs = segments_of(h, w)
+    print(f"\nplane limit: {w}x{h} -> {len(segs)} segment(s), one sweep each")
+    plan = []
+    for i, (x0, x1, y0, y1) in enumerate(segs, 1):
+        name = f"seg{i:02d}_{x1 - x0}x{y1 - y0}"
+        print(f"\n======== segment {i}/{len(segs)}: {x1 - x0}x{y1 - y0} at ({x0},{y0})")
+        b = argparse.Namespace(**vars(a))
+        b.segment = f"{x0},{y0},{x1 - x0},{y1 - y0}"
+        b.out = os.path.join(out, name)
+        cmd_sweep(b)
+        plan.append({"name": name, "x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0,
+                     "folder": os.path.abspath(b.actual_out)})
+    with open(os.path.join(out, "split.json"), "w", encoding="utf-8") as f:
+        json.dump({"source": os.path.abspath(a.source), "width": w, "height": h,
+                   "plane_max": PLANE_MAX, "segments": plan}, f, ensure_ascii=False, indent=2)
+    rows = "".join(
+        f'<li><a href="{html.escape(os.path.relpath(p["folder"], out).replace(os.sep, "/"))}'
+        f'/sweep.html">{html.escape(p["name"])}</a> - {p["width"]}x{p["height"]} '
+        f'at ({p["x"]},{p["y"]})</li>' for p in plan)
+    with open(os.path.join(out, "split.html"), "w", encoding="utf-8") as f:
+        f.write(f"<!doctype html><meta charset='utf-8'><title>split - "
+                f"{html.escape(base_name)}</title><h1>{html.escape(base_name)}: "
+                f"{w}x{h} in {len(plan)} segments</h1><ul>{rows}</ul>")
+    print(f"\nsplit plan: {os.path.join(out, 'split.json')}")
+    for p in plan:
+        print(f"  {p['name']}: {p['folder']}")
+    # the window opens and exports from one sweep folder: the first segment
+    setattr(a, "actual_out", plan[0]["folder"])
+    setattr(a, "split_out", out)
+    return 0
+
+
 def _sweep_inputs(a):
     """The prepared source and the shared answers of a sweep.
 
@@ -286,15 +368,24 @@ def _sweep_inputs(a):
     """
     bg = parse_fill(a.bg_color)
     rgb0 = load(a.source, bg)
+    # v2.12: optional resize before the padding (same rule as the Background tool)
+    resize = resize_text(getattr(a, "resize", None))
+    method = resize_method(getattr(a, "resize_method", None))
+    rgb0 = resize_to(rgb0, resize, method)
     rgb0, _ = apply_pad(rgb0, a)
     if rgb0.shape[0] % 8 or rgb0.shape[1] % 8:
         raise SystemExit(f"image sides must be multiples of 8: "
                          f"{rgb0.shape[1]}x{rgb0.shape[0]}")
-    gain = auto_gain(rgb0) if a.gain in (None, "auto") else float(a.gain)
+    # v2.16: over the 512 px plane - keep (none), shrink to fit or split (the
+    # split runs one sweep per segment, see _sweep_split)
+    oversize = getattr(a, "oversize", None) or "none"
+    if oversize not in OVERSIZE:
+        raise SystemExit(f"--oversize {oversize}: use one of {', '.join(OVERSIZE)}")
+    if oversize == "resize" and max(rgb0.shape[:2]) > PLANE_MAX:
+        rgb0 = scale_to_fit(rgb0, method=method)
+        rgb0, _ = apply_pad(rgb0, a)
+    gain = parse_gain(a.gain, rgb0)
     rgb = prepare(rgb0, gain, float(a.brightness or 0))
-    w, h = rgb.shape[1], rgb.shape[0]
-    pan = (w > 320 or h > 224)
-    cap_scope = a.cap_scope if a.cap_scope != "auto" else ("view" if pan else "image")
     if a.backdrop == "color" and a.backdrop_color:
         chave = parse_fill(a.backdrop_color)
     else:
@@ -306,14 +397,29 @@ def _sweep_inputs(a):
         key_holes, why = True, "colour chosen by the author"
     else:
         key_holes, _, why = backdrop_is_real(rgb, key_src, a.source)
+    # v2.16: one segment of a split image. Gain, backdrop and transparency
+    # come from the WHOLE image above, so the segments match each other.
+    full_size = (rgb.shape[1], rgb.shape[0])
+    seg = parse_segment(getattr(a, "segment", None))
+    if seg is not None:
+        x0, y0, sw_, sh_ = seg
+        if x0 + sw_ > rgb.shape[1] or y0 + sh_ > rgb.shape[0]:
+            raise SystemExit(f"segment {seg} is outside the {rgb.shape[1]}x"
+                             f"{rgb.shape[0]} image")
+        rgb = np.ascontiguousarray(rgb[y0:y0 + sh_, x0:x0 + sw_])
+    w, h = rgb.shape[1], rgb.shape[0]
+    pan = (w > 320 or h > 224)
+    cap_scope = a.cap_scope if a.cap_scope != "auto" else ("view" if pan else "image")
     resp = {
         "palettes": None, "palette_file": None, "mode": None,
         "transparency": True, "dithering": None,
-        "dither_strength": None, "scroll": pan, "resize": "none",
+        "dither_strength": None, "scroll": pan, "resize": resize,
+        "resize_method": method,
         "max_tiles": None, "cap_scope": cap_scope,
         "backdrop": a.backdrop, "backdrop_rgb": a.backdrop_color,
-        "oversize": "none", "gain": gain, "brightness": float(a.brightness or 0),
-        "key": key, "key_src": key_src, "view_height": WIN_H * 8,
+        "oversize": oversize, "gain": gain, "brightness": float(a.brightness or 0),
+        "key": key, "key_src": key_src, "view_height": view_height_px(),
+        "scroll_margin": scroll_margin(),
         "key_holes": bool(key_holes),
     }
     resp["sprite"] = transparent_fraction(a.source) > 0.05
@@ -324,6 +430,8 @@ def _sweep_inputs(a):
     # normal and shadow tiles (--shadow-free-contours = old, each tile alone)
     resp["shadow_contour"] = not bool(getattr(a, "shadow_free_contours", False))
     return dict(rgb=rgb, gain=gain, pan=pan, cap_scope=cap_scope, key=key,
+                resize=resize, resize_method=method, oversize=oversize,
+                segment=seg, full_size=full_size,
                 key_src=key_src, key_holes=key_holes, why=why, resp=resp)
 
 
@@ -355,7 +463,7 @@ def build_base(rgb, pals, resp, vq=None, seed=0):
                                          minlength=len(pals)).tolist()}
 
 
-def export_variant(folder, name, base, var, pals, resp, stem):
+def export_variant(folder, name, base, var, pals, resp, stem, res_dir=None):
     """Write the files of one sweep variant, the same set the md_fundo emit
     step writes: indexed PNG (palette and priority bits), .pal files, .res,
     map JSON, preview and report.md (with the C code).
@@ -387,7 +495,9 @@ def export_variant(folder, name, base, var, pals, resp, stem):
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"source": resp.get("source", ""), "answers": answers,
                    "samples": [sample]}, f)
-    res = os.path.join(folder, "res", f"{name}.res")
+    # v2.16: the .res, palettes, map and indexed PNG go to res_dir when given
+    # (the project's res folder), else to res/ inside the export folder
+    res = os.path.join(res_dir or os.path.join(folder, "res"), f"{name}.res")
     with contextlib.redirect_stdout(io.StringIO()):
         do_emit(path, name, res, resp, "1")
     return res
@@ -538,17 +648,23 @@ def _sweep_init(state):
     _STATE.clear()
     _STATE.update(state)
     set_view_height(int(state.get("view_height") or 224))
+    set_scroll_margin(state.get("scroll_margin", False))
+    set_color_weight(state.get("color_weight", 1.0))
+    set_solid_pref(state.get("solid_pref", 0.5))
+    set_grey_mode(state.get("grey_mode", False))
 
 
 def _sweep_palette_job(key_):
-    n, plan, pd = key_
+    n, plan, pd, strength, seed = key_
     st = _STATE
     r = dict(st["resp"])
     r["palettes"] = n
     r["dithering"] = pd
+    if strength is not None:
+        r["dither_strength"] = strength
     r["mode"] = "shadow" if plan else "normal"
     t = time.time()
-    pals, _, _ = optimize_palettes(st["rgb"], r, seed=st["seed"], rounds=st["rounds"])
+    pals, _, _ = optimize_palettes(st["rgb"], r, seed=seed, rounds=st["rounds"])
     return [np.asarray(p, np.uint8) for p in pals], time.time() - t
 
 
@@ -558,13 +674,15 @@ def _sweep_variant_job(j):
     rgb, out = st["rgb"], st["out"]
     n, dith, strength, column, vq, plan = (j["n"], j["dith"], j["strength"],
                                            j["column"], j["vq"], j["plan"])
+    seed = int(j.get("seed", st["seed"]))
     pals = j["pals"]
     r = dict(st["resp"])
     r.update(palettes=n, dithering=dith, dither_strength=strength,
              mode="shadow" if plan else "normal", max_tiles=vq)
     t = time.time()
-    base = build_base(rgb, pals, r, vq=vq, seed=st["seed"])
-    lines = [f"  base {n}p/{column}/t{vq}{' shadow' if plan else ''}: "
+    base = build_base(rgb, pals, r, vq=vq, seed=seed)
+    lines = [f"  base {n}p/{column}/t{vq}{' shadow' if plan else ''}"
+             f"{f' seed {seed}' if seed else ''}: "
              f"{time.time() - t:.1f}s  {base['tiles']} tiles  peak {base['peak'][0]}"]
     recs = []
     x, y, cw, ch = st["crop"]
@@ -576,7 +694,7 @@ def _sweep_variant_job(j):
         rr = dict(r)
         rr["mode"] = mode
         var = render_variant(rgb, base, pals, rr, mode)
-        stem = f"p{n}_{dith}_{strength}_t{vq}_{mode}"
+        stem = f"p{n}_{dith}_{strength}_t{vq}_{mode}" + (f"_s{seed}" if seed else "")
         thumb = os.path.join(st["thumbs"], stem + ".png")
         Image.fromarray(var["rgb"][y:y + ch, x:x + cw]).save(thumb)
         hl_thumb = None
@@ -592,7 +710,7 @@ def _sweep_variant_job(j):
         kb = (base["bytes_tiles"] + base["bytes_map"] + 32 * n) / 1024.0
         rec = {
             "palettes": n, "dithering": dith, "strength": strength,
-            "column": column, "max_tiles": vq, "mode": mode,
+            "column": column, "max_tiles": vq, "mode": mode, "seed": seed,
             "tiles": base["tiles"], "bytes_tiles": base["bytes_tiles"],
             "bytes_map": base["bytes_map"],
             "peak": p[0], "peak_x0": p[1] * 8, "peak_y0": p[2] * 8,
@@ -629,6 +747,7 @@ def _sweep_variant_job(j):
 def cmd_sweep(a):
     """Generate a comparison grid of setup answers, without asking per cell."""
     set_view_height(int(getattr(a, "view_height", None) or 224))
+    set_scroll_margin(getattr(a, "scroll_margin", False) or False)
     palettes = [int(v) for v in _csv_list(a.palettes, None, "--palettes")]
     if any(p < 1 or p > 4 for p in palettes):
         raise SystemExit("--palettes must be between 1 and 4")
@@ -636,6 +755,11 @@ def cmd_sweep(a):
     modes = _csv_list(a.modes, MODES, "--modes")
     strengths = _csv_list(a.dither_strength, tuple(DITHER_STRENGTHS),
                           "--dither-strength")
+    # v2.14: variations - every combination again with seed, seed + 1, ...
+    nvar = int(getattr(a, "variations", 1) or 1)
+    if not 1 <= nvar <= 50:
+        raise SystemExit("--variations must be between 1 and 50")
+    seeds = [int(a.seed) + i for i in range(nvar)]
 
     # "none" and "floyd" ignore the strength value; keep one column for them
     # so the grid does not contain identical variants.
@@ -651,20 +775,51 @@ def cmd_sweep(a):
     rgb, gain, pan, cap_scope = inp["rgb"], inp["gain"], inp["pan"], inp["cap_scope"]
     key, key_holes, why, resp = inp["key"], inp["key_holes"], inp["why"], inp["resp"]
     w, h = rgb.shape[1], rgb.shape[0]
+    if inp["oversize"] == "split" and inp["segment"] is None and max(w, h) > PLANE_MAX:
+        return _sweep_split(a, w, h)
+
+    # v2.13: colour weight of the dither choice (1 = normal)
+    cweight = set_color_weight(getattr(a, "color_weight", None))
+    # v2.16: dots vs solid colour preference (0.5 = normal)
+    spref = set_solid_pref(getattr(a, "solid", None))
+    # v2.14: grey mode - colours count only as the grey a monochrome filter shows
+    greym = set_grey_mode(getattr(a, "grey", False) or False)
+    if greym:
+        print("\nGREY MODE: colours count only as the grey a monochrome filter shows "
+              "(BlastEm levels, Rec.601). View the result through the filter.")
+    # v2.13: fixed palettes from a file - no optimization, one palette count
+    fixed, pal_notes = load_palette_set(getattr(a, "palette_file", None), key)
+    if fixed is not None:
+        if palettes != [len(fixed)]:
+            print(f"\npalette file: {len(fixed)} palette{'s' if len(fixed) > 1 else ''}"
+                  f" - the palette count {palettes} is replaced by {len(fixed)}")
+        palettes = [len(fixed)]
 
     if w > 512 or h > 512:
-        print(f"\nWARNING: {w}x{h} is above 512x512. No resize and no split: "
+        print(f"\nWARNING: {w}x{h} is above 512x512. No split: "
               "the plane limit is ignored, the ROM must handle it.")
+    rs = (f"resized ({inp['resize']}, {inp['resize_method']})"
+          if inp["resize"] != "none" else "no resize")
+    if inp["segment"] is not None:
+        sx, sy = inp["segment"][:2]
+        fw, fh = inp["full_size"]
+        sp = f"segment at ({sx},{sy}) of {fw}x{fh}"
+    elif inp["oversize"] == "resize":
+        sp = "shrunk to fit the plane when over 512"
+    else:
+        sp = "no split"
     print(f"\nmode: {'pan background' if pan else 'static image'} "
-          f"({w}x{h}) · cap scope: {cap_scope} · no resize, no split")
+          f"({w}x{h}) · cap scope: {cap_scope} · {rs}, {sp}")
 
     info = preflight(rgb)
     print_preflight(info)
     auto_max = info["pior_tela"]
     budgets, auto_max, auto_75 = _parse_budgets(a.max_tiles, auto_max)
-    total = len(palettes) * len(modes) * len(dither_specs) * len(budgets)
+    total = len(palettes) * len(modes) * len(dither_specs) * len(budgets) * len(seeds)
     n_opt = len(palettes) * (len(dithers) if (getattr(a, "palette_dither", None)
                                              or "same") == "same" else 1)
+    if fixed is not None:
+        n_opt = 0
     est = estimate_sweep_seconds(w, h, total, info, budgets, n_opt)
     all_checked = (len(palettes) == 4 and len(modes) == 4
                    and len(dithers) == len(DITHERS)
@@ -700,6 +855,18 @@ def cmd_sweep(a):
     print(f"  palettes: {palettes}")
     print(f"  dithering: {dithers}  strengths {strengths}")
     print(f"  modes: {modes}")
+    if len(seeds) > 1:
+        print(f"  variations: {len(seeds)} (seeds {seeds[0]} to {seeds[-1]})")
+    if cweight != 1.0:
+        print(f"  colour weight: {cweight * 100:.0f}% (colour against lightness, in "
+              "every colour comparison of the conversion)")
+    if spref != 0.5:
+        print(f"  solid colour preference: {spref * 100:.0f}% (50% = normal; higher "
+              "draws fewer dots)")
+    if greym:
+        print("  grey mode: on")
+    if scroll_margin():
+        print("  scroll margin: on (the cap counts one more tile row and column)")
     print(f"  backdrop: #{key[0]:02X}{key[1]:02X}{key[2]:02X}  "
           f"budgets {budgets} ({cap_scope})")
     print(f"  transparent backdrop holes: {'yes' if key_holes else 'NO'} ({why})")
@@ -711,7 +878,14 @@ def cmd_sweep(a):
               "between normal and shadow)" if resp["shadow_contour"]
               else "free (--shadow-free-contours)"))
     pd_mode = getattr(a, "palette_dither", None) or "same"
-    if pd_mode == "same":
+    if fixed is not None:
+        print("  palettes: FROM FILE, not optimized (index 0 of each = the backdrop)")
+        for note in pal_notes:
+            print(f"    {note}")
+        for i, p in enumerate(fixed):
+            print(f"    pal{i}: " + " ".join(f"{c[0]:02X}{c[1]:02X}{c[2]:02X}"
+                                          for c in p))
+    elif pd_mode == "same":
         print("  palettes: optimized with each variant's own dithering (one per "
               "palette count x dither; shadow/both get their own, shadow planned in)")
     else:
@@ -734,8 +908,11 @@ def cmd_sweep(a):
     # MIX into a tone it lacks, so a dark gradient sky came out flat lilac in
     # normal and as dark shadow blocks in shadow. --palette-dither <name>
     # keeps one shared palette per count, optimized with that dither.
-    def pal_key(n, plan, dith):
-        return (n, plan, dith if pd_mode == "same" else pd_mode)
+    # v2.14: and every seed (variations) gets its own palettes. The strength
+    # is not in the key: the palettes come out the same for every strength
+    # (checked), so one search serves all of them.
+    def pal_key(n, plan, dith, strength, seed):
+        return (n, plan, dith if pd_mode == "same" else pd_mode, None, seed)
 
     variants = []
     crop = _parse_crop(a.crop)
@@ -752,15 +929,17 @@ def cmd_sweep(a):
                 (info["pior_y1"] - info["pior_y0"]) * 8)
 
     jobs = []
-    for n in palettes:
-        for dith, strength, column in dither_specs:
-            for vq in budgets:
-                for plan, gmodes in groups:
-                    jobs.append(dict(i=len(jobs), n=n, dith=dith, strength=strength,
-                                     column=column, vq=vq, plan=plan, modes=gmodes))
+    for seed in seeds:
+        for n in palettes:
+            for dith, strength, column in dither_specs:
+                for vq in budgets:
+                    for plan, gmodes in groups:
+                        jobs.append(dict(i=len(jobs), n=n, dith=dith, strength=strength,
+                                         column=column, vq=vq, plan=plan, modes=gmodes,
+                                         seed=seed))
     keys = []
     for j in jobs:
-        k_ = pal_key(j["n"], j["plan"], j["dith"])
+        k_ = pal_key(j["n"], j["plan"], j["dith"], j["strength"], j["seed"])
         if k_ not in keys:
             keys.append(k_)
 
@@ -769,7 +948,9 @@ def cmd_sweep(a):
                  full=bool(a.full), export=bool(getattr(a, "export", False)),
                  source=a.source, out=out, thumbs=thumbs, full_dir=full_dir,
                  crop=crop, base_name=base_name, cap_scope=cap_scope,
-                 view_height=WIN_H * 8, total=total)
+                 view_height=view_height_px(), scroll_margin=scroll_margin(),
+                 total=total, color_weight=cweight, solid_pref=spref,
+                 grey_mode=greym)
     print(f"  workers: {workers} process{'es' if workers > 1 else ''} "
           f"({getattr(sweep_workers, 'why', '')}; --workers to change)")
     t_all = time.time()
@@ -783,13 +964,20 @@ def cmd_sweep(a):
         else:
             _sweep_init(state)
             run = lambda fn, items: ((it, fn(it)) for it in items)   # noqa: E731
-        for k_, (pals, secs) in run(_sweep_palette_job, keys):
-            pal_cache[k_] = pals
-            n, plan, pd = k_
-            print(f"  palettes {n}{' (shadow planned)' if plan else ''}, "
-                  f"optimized with {pd}: {secs:.1f}s", flush=True)
+        if fixed is not None:
+            for k_ in keys:
+                pal_cache[k_] = [np.asarray(p, np.uint8) for p in fixed]
+        else:
+            for k_, (pals, secs) in run(_sweep_palette_job, keys):
+                pal_cache[k_] = pals
+                n, plan, pd, pst, psd = k_
+                print(f"  palettes {n}{' (shadow planned)' if plan else ''}, "
+                      f"optimized with {pd}{'/' + pst if pst else ''}"
+                      f"{f' seed {psd}' if len(seeds) > 1 else ''}: {secs:.1f}s",
+                      flush=True)
         for j in jobs:
-            j["pals"] = pal_cache[pal_key(j["n"], j["plan"], j["dith"])]
+            j["pals"] = pal_cache[pal_key(j["n"], j["plan"], j["dith"], j["strength"],
+                                          j["seed"])]
         results = {}
         for j, (recs, lines) in run(_sweep_variant_job, jobs):
             results[j["i"]] = recs
@@ -814,7 +1002,15 @@ def cmd_sweep(a):
     meta = {
         "source": os.path.abspath(a.source), "width": rgb.shape[1],
         "height": rgb.shape[0], "gain": gain, "key": key,
-        "view_height": WIN_H * 8, "tool": "md_fundo_v2",
+        "resize": inp["resize"], "resize_method": inp["resize_method"],
+        "palette_file": palette_file_list(getattr(a, "palette_file", None)) or None,
+        "fixed_palettes": ([np.asarray(p, np.uint8).tolist() for p in fixed]
+                           if fixed is not None else None),
+        "brightness": float(getattr(a, "brightness", 0) or 0),
+        "color_weight": cweight, "solid_pref": spref, "grey_mode": greym,
+        "seeds": seeds,
+        "view_height": view_height_px(), "scroll_margin": scroll_margin(),
+        "tool": "md_fundo_v2",
         "palettes": palettes, "dithering": dithers, "strengths": strengths,
         "dither_specs": [{"dither": d, "strength": s, "column": c}
                          for d, s, c in dither_specs],
@@ -853,14 +1049,19 @@ ARG_KEYS = ("source", "palettes", "dithering", "modes", "dither_strength",
             "palette_dither", "palette_rounds", "max_tiles", "cap_scope",
             "view_height", "crop", "gain", "brightness", "bg_color", "no_pad",
             "pad_color", "backdrop", "backdrop_color", "seed", "shadow_dotted_edges",
-            "shadow_free_contours", "shadow_late")
+            "shadow_free_contours", "shadow_late", "resize", "resize_method",
+            "palette_file", "color_weight", "solid", "grey", "scroll_margin",
+            "variations", "oversize", "segment")
 # sweeps written before v2.11 kept no options: these are the window's
 # defaults, and the contour rule did not exist yet
 OLD_SWEEP_ARGS = dict(bg_color=None, no_pad=False, pad_color=None, gain="auto",
                       brightness=0.0, backdrop="border", backdrop_color=None, seed=0,
                       palette_rounds=2, palette_dither="same", shadow_late=False,
                       shadow_dotted_edges=False, shadow_free_contours=True,
-                      view_height=224, cap_scope="auto", crop=None)
+                      view_height=224, cap_scope="auto", crop=None,
+                      resize="none", resize_method="nearest", palette_file=None,
+                      color_weight=1.0, solid=0.5, grey=False, scroll_margin=False,
+                      variations=1, oversize="none", segment=None)
 
 
 def sweep_args(a):
@@ -880,8 +1081,9 @@ def variant_label(v):
     n = v["palettes"]
     kb = v.get("kb_total")
     kb = f" · {kb:.1f} KB" if kb is not None else ""
+    sd = f' · seed {v["seed"]}' if v.get("seed") else ""
     return (f'{n} palette{"s" if n > 1 else ""} · {v["column"]} · '
-            f'{v["max_tiles"]} tiles · {v["mode"]} - dE {v["de_mean"]:.2f} · '
+            f'{v["max_tiles"]} tiles · {v["mode"]}{sd} - dE {v["de_mean"]:.2f} · '
             f'perc {v.get("de_perceived", v["de_mean"]):.2f}{kb}')
 
 
@@ -897,8 +1099,12 @@ def load_sweep(folder):
         return folder, json.load(f)
 
 
-def export_one(folder, stem, log=print):
+def export_one(folder, stem, log=print, name=None, res_dir=None):
     """Compute one variant of a sweep again and write its files.
+
+    name: the name of the exported files (default: the source file name, plus
+    the segment of a split); res_dir: where the .res and its files go
+    (default: export/<variant>/res inside the sweep folder).
 
     Returns (export folder, identical): identical is True when the variant
     came out pixel for pixel as the sweep drew it (thumbnail and, when it
@@ -918,27 +1124,43 @@ def export_one(folder, stem, log=print):
     d["source"] = meta["source"]
     d["gain"] = meta["gain"]
     d["view_height"] = int(meta.get("view_height") or d.get("view_height") or 224)
+    d["scroll_margin"] = bool(meta.get("scroll_margin", d.get("scroll_margin", False)))
     a = argparse.Namespace(**d)
     if not os.path.isfile(a.source):
         raise SystemExit(f"the source image of this sweep is gone: {a.source}")
     set_view_height(a.view_height)
+    set_scroll_margin(a.scroll_margin)
+    set_color_weight(getattr(a, "color_weight", 1.0))
+    set_solid_pref(getattr(a, "solid", 0.5))
+    set_grey_mode(getattr(a, "grey", False) or False)
     t = time.time()
     inp = _sweep_inputs(a)
     rgb, resp = inp["rgb"], inp["resp"]
     resp["cap_scope"] = meta.get("cap_scope", resp["cap_scope"])
     n, dith, strength = v["palettes"], v["dithering"], v["strength"]
     vq, mode = v["max_tiles"], v["mode"]
+    seed = int(v.get("seed", a.seed))
     plan = (not a.shadow_late) and mode in ("shadow", "both")
     pd_mode = meta.get("palette_dither") or "same"
+    # the sweep made the palettes of a group once, with the first strength and
+    # the first budget of the run (resp.update in cmd_sweep): the same here,
+    # or "clean"/"full" variants got other palettes and differed
+    first = lambda k: (meta.get(k) or [None])[0]   # noqa: E731
     r = dict(resp, palettes=n, dithering=dith if pd_mode == "same" else pd_mode,
-             mode="shadow" if plan else "normal")
-    log(f"  {stem}: palettes...")
-    pals, _, _ = optimize_palettes(rgb, r, seed=a.seed, rounds=a.palette_rounds)
-    pals = [np.asarray(p, np.uint8) for p in pals]
+             mode="shadow" if plan else "normal",
+             dither_strength=first("strengths"), max_tiles=first("budgets"))
+    if meta.get("fixed_palettes"):
+        # palettes read from a file at sweep time: the same colours, even if
+        # the file changed or moved since
+        pals = [np.asarray(p, np.uint8) for p in meta["fixed_palettes"]]
+    else:
+        log(f"  {stem}: palettes...")
+        pals, _, _ = optimize_palettes(rgb, r, seed=seed, rounds=a.palette_rounds)
+        pals = [np.asarray(p, np.uint8) for p in pals]
     r2 = dict(resp, palettes=n, dithering=dith, dither_strength=strength,
               mode="shadow" if plan else "normal", max_tiles=vq)
     log(f"  {stem}: tiles...")
-    base = build_base(rgb, pals, r2, vq=vq, seed=a.seed)
+    base = build_base(rgb, pals, r2, vq=vq, seed=seed)
     rr = dict(r2, mode=mode)
     var = render_variant(rgb, base, pals, rr, mode)
     # the check: what the sweep drew
@@ -959,9 +1181,16 @@ def export_one(folder, stem, log=print):
     identical = bool(diffs) and max(diffs) == 0
     exp_dir = os.path.join(folder, "export", stem)
     base_name = os.path.splitext(os.path.basename(a.source))[0]
-    res = export_variant(exp_dir, c_name(base_name), base, var, pals,
-                         dict(rr, source=a.source), stem)
-    v["export"] = os.path.relpath(os.path.dirname(res), folder).replace(os.sep, "/")
+    seg = parse_segment(getattr(a, "segment", None))
+    if seg is not None:
+        base_name += f"_seg_{seg[0]}_{seg[1]}"
+    res = export_variant(exp_dir, c_name((name or "").strip() or base_name), base, var,
+                         pals, dict(rr, source=a.source), stem,
+                         res_dir=(res_dir or "").strip() or None)
+    try:
+        v["export"] = os.path.relpath(os.path.dirname(res), folder).replace(os.sep, "/")
+    except ValueError:          # another drive
+        v["export"] = os.path.dirname(res)
     with open(os.path.join(folder, "sweep.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     _write_sweep_html(folder, meta, rgb)
@@ -972,6 +1201,8 @@ def export_one(folder, stem, log=print):
             f"{max(diffs)} pixels (the sweep was made with another version or "
             f"other options); the files match export/{stem}/1.png, not the gallery")
     log(f"  files: {exp_dir}")
+    if os.path.dirname(res) != os.path.join(exp_dir, "res"):
+        log(f"  .res and its files: {os.path.dirname(res)}")
     return exp_dir, identical
 
 
@@ -993,7 +1224,8 @@ def cmd_export(a):
         picked.append(item)
     ok = True
     for stem in picked:
-        _, same = export_one(folder, stem)
+        _, same = export_one(folder, stem, name=getattr(a, "name", None),
+                             res_dir=getattr(a, "res", None))
         ok = ok and same
     return 0 if ok else 2
 
@@ -1060,13 +1292,24 @@ def main():
                        help="do not pad the image to multiples of 8")
         p.add_argument("--pad-color", help="RRGGBB of the padded border (default FFFFFF)")
         p.add_argument("--scroll", choices=("yes", "no"))
-        p.add_argument("--resize", choices=("width", "height", "none"))
+        p.add_argument("--resize", help="width, height, none, 400x, x300 or 400x300")
+        p.add_argument("--resize-method", choices=RESIZE_METHODS)
+        p.add_argument("--color-weight", type=float,
+                       help="colour weight vs lightness, 0..1 (default 1 = normal; "
+                            "0 = lightness only)")
+        p.add_argument("--solid", type=float,
+                       help="dots vs solid colour, 0..1 (default 0.5 = normal; "
+                            "higher draws fewer dots, lower dithers more)")
+        p.add_argument("--grey", choices=("on", "off"),
+                       help="grey mode: measure only the grey a monochrome filter "
+                            "shows (BlastEm levels, Rec.601)")
         p.add_argument("--bg-color", help="RRGGBB behind the alpha channel (default FFFFFF)")
         p.add_argument("--oversize", choices=("split", "resize", "none"),
                        help="what to do when a side is over the 512 px plane limit")
         p.add_argument("--max-tiles", type=int,
                        help="cap the unique tiles of every sample (0 = no limit)")
         p.add_argument("--view-height", type=int, choices=(224, 240), default=224)
+        p.add_argument("--scroll-margin", choices=("on", "off"))
         p.add_argument("--cap-scope", choices=("image", "view"),
                        help="does the tile cap apply to the whole image"
                             " or to each 320x240 view")
@@ -1099,10 +1342,43 @@ def main():
                    help="auto: view for pan backgrounds, image for static")
     s.add_argument("--view-height", type=int, choices=(224, 240), default=224,
                    help="one view for the per-view cap: 224 NTSC, 240 PAL")
+    s.add_argument("--scroll-margin", action="store_true",
+                   help="the per-view tile cap counts one more tile row and "
+                        "column: the ones a pixel-by-pixel scroll shows")
     s.add_argument("--crop", help="thumbnail crop x,y,w,h (default: peak view)")
     s.add_argument("--full", action="store_true",
                    help="also write full-size RGB previews for every variant")
-    s.add_argument("--gain", default="auto")
+    s.add_argument("--resize", default="none",
+                   help="resize the source first: none, 400x (width 400, aspect kept),"
+                        " x300 (height 300, aspect kept), 400x300 (both sides),"
+                        " width (=320x) or height (=x224)")
+    s.add_argument("--resize-method", choices=RESIZE_METHODS, default="nearest",
+                   help="nearest (default, adds no colour) or an interpolation")
+    s.add_argument("--palette-file",
+                   help="fixed palettes from a file (.pal or .png) instead of "
+                        "optimizing them; several files separated by ';'. Every "
+                        "16 colours make one palette (colour 0 = backdrop slot); "
+                        "the palette count comes from the file")
+    s.add_argument("--gain", default="auto",
+                   help="brightness gain: auto (default), none (=1.0) or a number "
+                        "like 1.2")
+    s.add_argument("--color-weight", type=float, default=1.0,
+                   help="weight of the colour against the lightness in every "
+                        "colour comparison of the conversion: 1 (default, normal) "
+                        "down to 0 (lightness only). Lower lets slightly tinted "
+                        "colours of the right lightness in")
+    s.add_argument("--solid", type=float, default=0.5,
+                   help="dots vs solid colour, 0..1 (default 0.5 = normal; higher "
+                        "draws fewer dots, lower dithers more)")
+    s.add_argument("--oversize", choices=OVERSIZE, default="none",
+                   help="over the 512 px plane: none (keep, the ROM handles it), "
+                        "resize (shrink to fit) or split (one sweep per segment)")
+    s.add_argument("--segment", help=argparse.SUPPRESS)
+    s.add_argument("--grey", action="store_true",
+                   help="grey mode: every colour counts only as the grey a "
+                        "monochrome filter shows (the MD levels as BlastEm "
+                        "outputs them, Rec.601). Any colour of the right grey "
+                        "will do: view the result through the filter.")
     s.add_argument("--brightness", type=float, default=0.0)
     s.add_argument("--bg-color")
     s.add_argument("--no-pad", action="store_true")
@@ -1110,6 +1386,9 @@ def main():
     s.add_argument("--backdrop", choices=("border", "color"), default="border")
     s.add_argument("--backdrop-color")
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--variations", type=int, default=1,
+                   help="run every combination this many times, with seed, "
+                        "seed + 1, ... (1 = once, as before; up to 50)")
     s.add_argument("--workers", type=int, default=0,
                    help="worker processes (0 = auto: cores - 1, limited by free memory)")
     s.add_argument("--export", action="store_true",
@@ -1135,6 +1414,10 @@ def main():
     e.add_argument("--variant", help="variant name as shown under each picture in "
                    "sweep.html (or its number); comma list for several; "
                    "blank = list them")
+    e.add_argument("--name", help="name of the exported files (default: the source "
+                   "file name)")
+    e.add_argument("--res", help="folder for the .res, palettes, map and indexed PNG "
+                   "(default: export/<variant>/res inside the sweep folder)")
     e.set_defaults(func=cmd_export, cmd="export")
 
     sub.add_parser("selftest").set_defaults(func=lambda a: selftest())

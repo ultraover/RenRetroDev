@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""MD Background Tools: one start screen for the four tools.
+"""MD Background Tools: one start screen for the tools.
 
     python tools/md_tools.py            start screen
     python tools/md_tools.py --run X    run one tool directly
-                                        (X = background-gui, background-console,
-                                         sweep-gui, sweep-console)
+                                        (X = sweep-gui, sweep-console, tile-editor;
+                                         background-gui and background-console
+                                         still run, but are off the start
+                                         screen: the sweep does what they did)
 
 Each choice starts the tool in its own process (its own window or console),
 so the start screen stays open and several tools can run side by side. In
@@ -22,22 +24,20 @@ for _d in (HERE, SWEEP_DIR):
         sys.path.insert(0, _d)
 
 TITLE = "MD Background Tools"
-VERSION = "1.2"
+VERSION = "2.0"
 
 TOOLS = [
-    ("background-gui", "Background · window",
-     "Convert one image into a Mega Drive background. Four samples side by "
-     "side, big zoomable comparison, export of tiles, palettes, map and .res."),
-    ("background-console", "Background · console",
-     "The same conversion asked step by step in a console window. Drag the "
-     "image into the window; good for scripts and batch work."),
     ("sweep-gui", "Sweep · window",
-     "Try many combinations at once (palettes × dithering × modes × tile "
-     "budgets) and compare them in one HTML page. Optional export of every "
-     "variant."),
+     "Convert one image: try many combinations at once, compare them in one "
+     "HTML page and export the one you pick (tiles, palettes, map, .res)."),
     ("sweep-console", "Sweep · console",
      "The sweep from the command line: every option as a flag, or drag an "
      "image into the window for the default grid."),
+    ("tile-editor", "Tile editor",
+     "Open an export and rearrange its 8×8 tiles: copy, paste, delete, mirror "
+     "and turn the priority of each tile on or off. See where a tile is used "
+     "and edit its pixels, switch tile palettes and edit the palettes. Saving updates the image, the map and the preview "
+     "for your project."),
 ]
 
 
@@ -86,6 +86,9 @@ def run_tool(name, extra):
         return gui.main()
     if name == "sweep-gui":
         import sweep_gui_v2 as gui
+        return gui.main()
+    if name == "tile-editor":
+        import md_tile_editor as gui
         return gui.main()
     raise SystemExit(f"unknown tool: {name}")
 
@@ -155,9 +158,12 @@ def start_screen():
             lay.addWidget(lb)
         lay.addStretch(1)
         b.clicked.connect(lambda _=False, k=key: launch(k))
-        grid.addWidget(b, i // 2, i % 2)
+        if i == len(TOOLS) - 1 and len(TOOLS) % 2:
+            grid.addWidget(b, i // 2, 0, 1, 2)     # the odd last one spans both
+        else:
+            grid.addWidget(b, i // 2, i % 2)
     root.addLayout(grid)
-    w.resize(720, 340)
+    w.resize(720, 470)
     w.show()
     return app.exec()
 
