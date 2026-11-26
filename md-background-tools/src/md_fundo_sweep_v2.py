@@ -122,6 +122,9 @@ def shadow_hl_html(v):
                 f'rel="noopener">files (.res, .pal, map)</a>')
     if v.get("shadow_tiles"):
         out += f'<br>shadow {v["shadow_tiles"]} tiles'
+        if v.get("jump") is not None:
+            out += (f'<br>normal/shadow jump <b>{v["jump"]:.1f}</b> dE on '
+                    f'{100 * v.get("jump_share", 0):.0f}% of the picture')
     hs = v.get("hl_sprites")
     if hs is not None:
         if not hs["sprites"]:
@@ -239,6 +242,11 @@ def _write_sweep_html(out, meta, rgb):
         summary += f" · colour weight {float(meta['color_weight']) * 100:.0f}%"
     if float(meta.get("solid_pref", 0.5)) != 0.5:
         summary += f" · solid colour preference {float(meta['solid_pref']) * 100:.0f}%"
+    if (meta.get("uniforms") or [0.0]) != [0.0]:
+        summary += (" · normal/shadow uniformity "
+                    + ", ".join(f"{round(u * 100)}%" for u in meta["uniforms"])
+                    + " (jump = dE between the normal and the shadow side of one "
+                    "source colour)")
     if meta.get("scroll_margin"):
         summary += " · tile cap with scroll margin (+1 tile row and column)"
     if meta.get("grey_mode"):
@@ -454,7 +462,13 @@ def build_base(rgb, pals, resp, vq=None, seed=0):
     if shadow_on(resp) and shadow_mask is None:
         shadow_mask = np.zeros(tile_pal.shape, bool)
     painted[rec == 0] = backdrop_shown(pals, rec, shadow_mask)
+    jump = None
+    if shadow_mask is not None and shadow_mask.any():
+        keep = metric_keep(rgb, resp, shadow_mask)
+        jump = normal_shadow_jump(rgb, painted, np.repeat(np.repeat(
+            shadow_mask, 8, 0), 8, 1), ~keep)
     return {"idx": idx, "tile_pal": tile_pal, "uniq": uniq, "tilemap": tilemap,
+            "jump": jump,
             "rec": rec, "painted": painted, "tiles": len(uniq),
             "peak": peak, "bytes_tiles": int(len(uniq)) * 32,
             "bytes_map": int((h // 8) * (w // 8) * 2),
@@ -655,10 +669,11 @@ def _sweep_init(state):
 
 
 def _sweep_palette_job(key_):
-    n, plan, pd, strength, seed = key_
+    n, plan, pd, strength, seed, uni = key_
     st = _STATE
     r = dict(st["resp"])
     r["palettes"] = n
+    r["uniform"] = uni
     r["dithering"] = pd
     if strength is not None:
         r["dither_strength"] = strength
@@ -675,10 +690,11 @@ def _sweep_variant_job(j):
     n, dith, strength, column, vq, plan = (j["n"], j["dith"], j["strength"],
                                            j["column"], j["vq"], j["plan"])
     seed = int(j.get("seed", st["seed"]))
+    uni = float(j.get("uniform", 0.0))
     pals = j["pals"]
     r = dict(st["resp"])
     r.update(palettes=n, dithering=dith, dither_strength=strength,
-             mode="shadow" if plan else "normal", max_tiles=vq)
+             mode="shadow" if plan else "normal", max_tiles=vq, uniform=uni)
     t = time.time()
     base = build_base(rgb, pals, r, vq=vq, seed=seed)
     lines = [f"  base {n}p/{column}/t{vq}{' shadow' if plan else ''}"
@@ -694,7 +710,8 @@ def _sweep_variant_job(j):
         rr = dict(r)
         rr["mode"] = mode
         var = render_variant(rgb, base, pals, rr, mode)
-        stem = f"p{n}_{dith}_{strength}_t{vq}_{mode}" + (f"_s{seed}" if seed else "")
+        stem = (f"p{n}_{dith}_{strength}_t{vq}_{mode}" + (f"_s{seed}" if seed else "")
+                + (f"_u{round(uni * 100)}" if uni else ""))
         thumb = os.path.join(st["thumbs"], stem + ".png")
         Image.fromarray(var["rgb"][y:y + ch, x:x + cw]).save(thumb)
         hl_thumb = None
@@ -717,6 +734,11 @@ def _sweep_variant_job(j):
             "peak_x1": p[3] * 8, "peak_y1": p[4] * 8,
             "de_mean": var["de_mean"], "de_p95": var["de_p95"],
             "de_max": var["de_max"], "de_perceived": var["de_perceived"],
+            "uniform": uni,
+            "jump": (base["jump"][0] if base.get("jump") is not None
+                     and mode in ("shadow", "both") and plan else None),
+            "jump_share": (base["jump"][1] if base.get("jump") is not None
+                           and mode in ("shadow", "both") and plan else None),
             "shadow_tiles": (int(var["shadow_mask"].sum())
                              if var["shadow_mask"] is not None else 0),
             "hl_tiles": var["hl_tiles"], "hl_gain": var["hl_gain"],
@@ -761,6 +783,8 @@ def cmd_sweep(a):
         raise SystemExit("--variations must be between 1 and 50")
     seeds = [int(a.seed) + i for i in range(nvar)]
 
+    # v2.17: normal/shadow uniformity, a list in % (one column each)
+    uniforms = parse_uniforms(getattr(a, "uniform", None))
     # "none" and "floyd" ignore the strength value; keep one column for them
     # so the grid does not contain identical variants.
     dither_specs = []
@@ -771,6 +795,11 @@ def cmd_sweep(a):
             for s in strengths:
                 dither_specs.append((d, s, f"{d}/{s}"))
 
+    # every dither column again for every uniformity (only the shadow rows
+    # change with it)
+    dither_specs = [(d, s, c if uniforms == [0.0] else
+                     (f"{c} · uni {round(u * 100)}%" if u else f"{c} · uni 0%"), u)
+                    for d, s, c in dither_specs for u in uniforms]
     inp = _sweep_inputs(a)
     rgb, gain, pan, cap_scope = inp["rgb"], inp["gain"], inp["pan"], inp["cap_scope"]
     key, key_holes, why, resp = inp["key"], inp["key_holes"], inp["why"], inp["resp"]
@@ -863,6 +892,11 @@ def cmd_sweep(a):
     if spref != 0.5:
         print(f"  solid colour preference: {spref * 100:.0f}% (50% = normal; higher "
               "draws fewer dots)")
+    if uniforms != [0.0]:
+        print("  normal/shadow uniformity: "
+              + ", ".join(f"{round(u * 100)}%" for u in uniforms)
+              + " (shadow rows only; higher = one colour on both sides of a shadow "
+              "border, less fidelity)")
     if greym:
         print("  grey mode: on")
     if scroll_margin():
@@ -911,8 +945,9 @@ def cmd_sweep(a):
     # v2.14: and every seed (variations) gets its own palettes. The strength
     # is not in the key: the palettes come out the same for every strength
     # (checked), so one search serves all of them.
-    def pal_key(n, plan, dith, strength, seed):
-        return (n, plan, dith if pd_mode == "same" else pd_mode, None, seed)
+    def pal_key(n, plan, dith, strength, seed, uni=0.0):
+        return (n, plan, dith if pd_mode == "same" else pd_mode, None, seed,
+                uni if plan else 0.0)
 
     variants = []
     crop = _parse_crop(a.crop)
@@ -931,15 +966,15 @@ def cmd_sweep(a):
     jobs = []
     for seed in seeds:
         for n in palettes:
-            for dith, strength, column in dither_specs:
+            for dith, strength, column, uni in dither_specs:
                 for vq in budgets:
                     for plan, gmodes in groups:
                         jobs.append(dict(i=len(jobs), n=n, dith=dith, strength=strength,
                                          column=column, vq=vq, plan=plan, modes=gmodes,
-                                         seed=seed))
+                                         seed=seed, uniform=uni))
     keys = []
     for j in jobs:
-        k_ = pal_key(j["n"], j["plan"], j["dith"], j["strength"], j["seed"])
+        k_ = pal_key(j["n"], j["plan"], j["dith"], j["strength"], j["seed"], j["uniform"])
         if k_ not in keys:
             keys.append(k_)
 
@@ -970,14 +1005,15 @@ def cmd_sweep(a):
         else:
             for k_, (pals, secs) in run(_sweep_palette_job, keys):
                 pal_cache[k_] = pals
-                n, plan, pd, pst, psd = k_
+                n, plan, pd, pst, psd, pun = k_
                 print(f"  palettes {n}{' (shadow planned)' if plan else ''}, "
                       f"optimized with {pd}{'/' + pst if pst else ''}"
-                      f"{f' seed {psd}' if len(seeds) > 1 else ''}: {secs:.1f}s",
+                      f"{f' seed {psd}' if len(seeds) > 1 else ''}"
+                      f"{f' uniformity {round(pun * 100)}%' if pun else ''}: {secs:.1f}s",
                       flush=True)
         for j in jobs:
             j["pals"] = pal_cache[pal_key(j["n"], j["plan"], j["dith"], j["strength"],
-                                          j["seed"])]
+                                          j["seed"], j["uniform"])]
         results = {}
         for j, (recs, lines) in run(_sweep_variant_job, jobs):
             results[j["i"]] = recs
@@ -1012,8 +1048,9 @@ def cmd_sweep(a):
         "view_height": view_height_px(), "scroll_margin": scroll_margin(),
         "tool": "md_fundo_v2",
         "palettes": palettes, "dithering": dithers, "strengths": strengths,
-        "dither_specs": [{"dither": d, "strength": s, "column": c}
-                         for d, s, c in dither_specs],
+        "dither_specs": [{"dither": d, "strength": s, "column": c, "uniform": u}
+                         for d, s, c, u in dither_specs],
+        "uniforms": uniforms,
         "modes": modes, "palette_dither": a.palette_dither,
         "max_tiles": budgets, "budgets": budgets, "cap_scope": cap_scope,
         "pan": pan, "auto_max": auto_max, "auto_75": auto_75,
@@ -1051,7 +1088,7 @@ ARG_KEYS = ("source", "palettes", "dithering", "modes", "dither_strength",
             "pad_color", "backdrop", "backdrop_color", "seed", "shadow_dotted_edges",
             "shadow_free_contours", "shadow_late", "resize", "resize_method",
             "palette_file", "color_weight", "solid", "grey", "scroll_margin",
-            "variations", "oversize", "segment")
+            "variations", "oversize", "segment", "uniform")
 # sweeps written before v2.11 kept no options: these are the window's
 # defaults, and the contour rule did not exist yet
 OLD_SWEEP_ARGS = dict(bg_color=None, no_pad=False, pad_color=None, gain="auto",
@@ -1061,7 +1098,7 @@ OLD_SWEEP_ARGS = dict(bg_color=None, no_pad=False, pad_color=None, gain="auto",
                       view_height=224, cap_scope="auto", crop=None,
                       resize="none", resize_method="nearest", palette_file=None,
                       color_weight=1.0, solid=0.5, grey=False, scroll_margin=False,
-                      variations=1, oversize="none", segment=None)
+                      variations=1, oversize="none", segment=None, uniform="0")
 
 
 def sweep_args(a):
@@ -1071,6 +1108,26 @@ def sweep_args(a):
         if isinstance(v, (str, int, float, bool, type(None))):
             out[k] = v
     return out
+
+
+def parse_uniforms(text):
+    """--uniform: percentages, comma separated ("0", "0,50,100"); 0..100."""
+    if text is None or str(text).strip() == "":
+        return [0.0]
+    out = []
+    for item in str(text).replace(";", ",").split(","):
+        item = item.strip().rstrip("%").strip()
+        if not item:
+            continue
+        try:
+            p = float(item)
+        except ValueError:
+            raise SystemExit(f"--uniform {text}: use percentages like 0,50,100")
+        if not 0 <= p <= 100:
+            raise SystemExit(f"--uniform {item}: use a value from 0 to 100")
+        if p / 100.0 not in out:
+            out.append(p / 100.0)
+    return out or [0.0]
 
 
 def variant_stem(v):
@@ -1146,9 +1203,11 @@ def export_one(folder, stem, log=print, name=None, res_dir=None):
     # the first budget of the run (resp.update in cmd_sweep): the same here,
     # or "clean"/"full" variants got other palettes and differed
     first = lambda k: (meta.get(k) or [None])[0]   # noqa: E731
+    uni = float(v.get("uniform") or 0.0)
     r = dict(resp, palettes=n, dithering=dith if pd_mode == "same" else pd_mode,
              mode="shadow" if plan else "normal",
-             dither_strength=first("strengths"), max_tiles=first("budgets"))
+             dither_strength=first("strengths"), max_tiles=first("budgets"),
+             uniform=uni if plan else 0.0)
     if meta.get("fixed_palettes"):
         # palettes read from a file at sweep time: the same colours, even if
         # the file changed or moved since
@@ -1158,7 +1217,7 @@ def export_one(folder, stem, log=print, name=None, res_dir=None):
         pals, _, _ = optimize_palettes(rgb, r, seed=seed, rounds=a.palette_rounds)
         pals = [np.asarray(p, np.uint8) for p in pals]
     r2 = dict(resp, palettes=n, dithering=dith, dither_strength=strength,
-              mode="shadow" if plan else "normal", max_tiles=vq)
+              mode="shadow" if plan else "normal", max_tiles=vq, uniform=uni)
     log(f"  {stem}: tiles...")
     base = build_base(rgb, pals, r2, vq=vq, seed=seed)
     rr = dict(r2, mode=mode)
@@ -1300,6 +1359,8 @@ def main():
         p.add_argument("--solid", type=float,
                        help="dots vs solid colour, 0..1 (default 0.5 = normal; "
                             "higher draws fewer dots, lower dithers more)")
+        p.add_argument("--uniform", type=float,
+                       help="normal/shadow uniformity, 0..1 (default 0 = off)")
         p.add_argument("--grey", choices=("on", "off"),
                        help="grey mode: measure only the grey a monochrome filter "
                             "shows (BlastEm levels, Rec.601)")
@@ -1370,6 +1431,10 @@ def main():
     s.add_argument("--solid", type=float, default=0.5,
                    help="dots vs solid colour, 0..1 (default 0.5 = normal; higher "
                         "draws fewer dots, lower dithers more)")
+    s.add_argument("--uniform", default="0",
+                   help="normal/shadow uniformity in %%, one column each: 0 "
+                        "(default, off) or a list like 0,50,100. Higher: one colour "
+                        "on both sides of a shadow border, less fidelity")
     s.add_argument("--oversize", choices=OVERSIZE, default="none",
                    help="over the 512 px plane: none (keep, the ROM handles it), "
                         "resize (shrink to fit) or split (one sweep per segment)")

@@ -271,8 +271,8 @@ class SweepWindow(QWidget):
         self.rs.changed.connect(self._rs_timer.start)
 
         # v2.13: fixed palettes from a file, and the brightness gain
-        cg = QGroupBox("Palette file, brightness, colour weight, solid vs dots and grey "
-                       "mode (optional)")
+        cg = QGroupBox("Palette file, brightness, colour weight, solid vs dots, grey "
+                       "mode and normal/shadow uniformity (optional)")
         cl = QVBoxLayout(cg)
         pr = QHBoxLayout()
         pr.addWidget(QLabel("Palette file:"))
@@ -370,6 +370,27 @@ class SweepWindow(QWidget):
             "Pairs well with a palette file that climbs in grey.")
         self.ck_grey.toggled.connect(lambda s: self.sp_cweight.setEnabled(not s))
         gr.addWidget(self.ck_grey)
+        gr.addStretch(1)
+        cl.addLayout(gr)
+        # v2.17: uniformity between normal and shadow tiles
+        gr = QHBoxLayout()
+        gr.addWidget(QLabel("Normal/shadow uniformity:"))
+        self.ed_uniform = QLineEdit("0")
+        self.ed_uniform.setMaximumWidth(120)
+        self.ed_uniform.setPlaceholderText("0 or 0, 50, 100")
+        self.ed_uniform.setToolTip(
+            "With shadow: one piece of the drawing that crosses normal and shadow\n"
+            "tiles comes out in two colours, one on each side. Higher gives up\n"
+            "some fidelity for one colour on both sides: every source colour\n"
+            "shown in both states takes the colour of the state that shows most\n"
+            "of it, and the tiles move whole to that state when they can.\n"
+            "0% = off (as before). One value, or a list in % (0, 50, 100):\n"
+            "one column each. Only the shadow rows change. Each card shows the\n"
+            "normal/shadow jump: dE between the two sides of one source colour.")
+        self.ed_uniform.textChanged.connect(lambda *_: self.update_projection())
+        gr.addWidget(self.ed_uniform)
+        gr.addWidget(QLabel("% (0 = off; a list like 0, 50, 100 makes one column each; "
+                            "shadow rows only)"))
         gr.addStretch(1)
         cl.addLayout(gr)
         cl.addStretch(1)
@@ -499,11 +520,25 @@ class SweepWindow(QWidget):
         self.sp_var.setValue(1)
         self.sp_var.setToolTip(
             "Run every combination this many times, each with its own seed\n"
-            "(0, 1, 2, ...). The seed changes where the palette search starts\n"
-            "and which tiles are merged first, so each variation is a different\n"
-            "take on the same task. The same seed always gives the same result.")
+            "(the first seed, then +1, +2, ...). The seed changes where the\n"
+            "palette search starts (and, with the cap on the whole image, which\n"
+            "tiles are merged), so each variation is a different take on the\n"
+            "same task. The same seed always gives the same result.")
         self.sp_var.valueChanged.connect(self.update_projection)
         pl.addWidget(self.sp_var)
+        pl.addSpacing(12)
+        pl.addWidget(QLabel("First seed:"))
+        self.sp_seed = QSpinBox()
+        self.sp_seed.setRange(0, 999999)
+        self.sp_seed.setValue(0)
+        self.sp_seed.setToolTip(
+            "The seed of the first variation (0 = default). With 1 variation,\n"
+            "only this seed runs: type 9 to get seed 9 again. With N variations,\n"
+            "the seeds are this one and the next N - 1.\n"
+            "With a palette file the seed matters only when the tile cap applies\n"
+            "to the whole image and the image is over it.")
+        self.sp_seed.valueChanged.connect(self.update_projection)
+        pl.addWidget(self.sp_seed)
         root.addLayout(pl)
 
         ck = QGridLayout()
@@ -825,11 +860,22 @@ class SweepWindow(QWidget):
         for d in diths:
             specs += 1 if d == "none" else len(strengths)
         budgets = self.budget_count()
+        specs *= len(self.uniforms())
         samples = len(pals) * len(modes) * specs * budgets * self.sp_var.value()
         all_checked = (len(pals) == len(PALETTES) and len(modes) == len(MODES)
                        and len(diths) == len(DITHERS)
                        and len(strengths) == len(STRENGTHS))
         return pals, modes, diths, strengths, specs, budgets, samples, all_checked
+
+    def uniforms(self):
+        """The uniformity list typed (0..1 each); [0.0] when it does not read."""
+        ed = getattr(self, "ed_uniform", None)
+        if ed is None:
+            return [0.0]
+        try:
+            return md.parse_uniforms(ed.text())
+        except SystemExit:
+            return [0.0]
 
     def n_opt(self, pals, diths):
         """How many palette optimizations the sweep will run (0 with a file)."""
@@ -859,7 +905,10 @@ class SweepWindow(QWidget):
             src + f"{self.width}x{self.height} · {'pan background' if pan else 'static image'} · "
             f"{len(pals)} palettes × {len(modes)} modes × {specs} dither/strength "
             f"columns × {budgets} budgets"
-            + (f" × {self.sp_var.value()} variations" if self.sp_var.value() > 1 else "")
+            + (f" × {self.sp_var.value()} variations (seeds {self.sp_seed.value()} to "
+               f"{self.sp_seed.value() + self.sp_var.value() - 1})"
+               if self.sp_var.value() > 1 else
+               (f" · seed {self.sp_seed.value()}" if self.sp_seed.value() else ""))
             + f" = {samples} samples · "
             f"rough estimate {est / 60.0:.1f} min · "
             f"full PNGs ~{full_mb:.1f} MB")
@@ -919,6 +968,11 @@ class SweepWindow(QWidget):
             if r != QMessageBox.Yes:
                 return
 
+        try:
+            md.parse_uniforms(self.ed_uniform.text())
+        except SystemExit as e:
+            QMessageBox.warning(self, "Normal/shadow uniformity", str(e))
+            return
         args = argparse.Namespace(
             cmd="sweep", source=p, out=self.ed_out.text().strip() or None,
             palettes=",".join(pals), dithering=",".join(diths),
@@ -934,6 +988,7 @@ class SweepWindow(QWidget):
             palette_file=self.ed_palfile.text().strip() or None,
             color_weight=self.sp_cweight.value() / 100.0,
             solid=self.sp_solid.value() / 100.0,
+            uniform=self.ed_uniform.text().strip() or "0",
             grey=self.ck_grey.isChecked(),
             bg_color=self.bt_bg.property("hex"), no_pad=not self.ck_pad.isChecked(),
             pad_color=self.bt_pad.property("hex"),
@@ -941,7 +996,7 @@ class SweepWindow(QWidget):
             backdrop_color=(self.bt_backdrop.property("hex")
                             if self.cb_backdrop.currentIndex() == 1 else None),
             oversize=self.cb_over.currentData(),
-            seed=0, variations=self.sp_var.value(),
+            seed=self.sp_seed.value(), variations=self.sp_var.value(),
             view_height=240 if self.cb_view.currentIndex() == 1 else 224,
             scroll_margin=self.ck_margin.isChecked(),
             resize=self.rs.value(), resize_method=self.rs.method(),

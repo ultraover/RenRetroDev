@@ -20,8 +20,14 @@ def main():
            "--name", NAME, "--paths", SRC, "--distpath", DIST,
            "--workpath", os.path.join(HERE, "build"), "--specpath", os.path.join(HERE, "build")]
     for mod in ("md_color", "md_fundo_v2", "md_fundo_gui_v2", "md_fundo_sweep_v2",
-                "sweep_gui_v2", "md_tile_editor", "scipy.ndimage"):
+                "sweep_gui_v2", "md_tile_editor", "md_sprite", "sprite_gui",
+                "scipy.ndimage"):
         cmd += ["--hidden-import", mod]
+    # big packages the tools never use: SciPy can reach for them when they are
+    # installed, and PyInstaller would bundle them (PyTorch alone is ~390 MB)
+    for mod in ("torch", "torchvision", "torchaudio", "torchgen", "functorch",
+                "onnxruntime", "cv2", "tensorflow", "jax", "simple_lama_inpainting"):
+        cmd += ["--exclude-module", mod]
     cmd.append(os.path.join(SRC, "md_tools.py"))
     subprocess.check_call(cmd)
     exe = os.path.join(DIST, NAME + (".exe" if os.name == "nt" else ""))

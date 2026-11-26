@@ -2276,6 +2276,10 @@ def build(rgb, pals, resp, vq=None, seed=0):
         if keep.any():
             de_hl = metrics(rgb[keep], hl_img[keep])["de_mean"]
     usage = np.bincount(tile_pal.reshape(-1), minlength=len(pals)).tolist()
+    jump = None
+    if shadow_mask is not None:
+        sh_px = np.repeat(np.repeat(np.asarray(shadow_mask, bool), 8, 0), 8, 1)
+        jump = normal_shadow_jump(rgb, new, sh_px, ~keep)
     if resp.get("dithering", "none") == "none":
         seen = m["de_mean"]
     else:
@@ -2293,21 +2297,23 @@ def build(rgb, pals, resp, vq=None, seed=0):
             "de_mean": m["de_mean"], "de_p95": m["de_p95"], "de_max": m["de_max"],
             "palette_usage": usage, "vq": vq,
             "shadow_mask": shadow_mask, "hl_tiles": hl_tiles, "hl_gain": hl_gain,
-            "rgb_hl": hl_img, "hl_sprites": hl_sprites, "de_hl": de_hl}
+            "rgb_hl": hl_img, "hl_sprites": hl_sprites, "de_hl": de_hl,
+            "jump": jump}
 
 
 
 
 
-def palette_options(rgb, pals, resp):
+def palette_options(rgb, pals, resp, target=None):
     """Paint the whole image with each palette: (index, per-pixel error) each.
 
     Painting every palette over the full image keeps the ordered dither grid
     aligned with the picture, so a tile that changes palette keeps the same
-    phase as its neighbours.
+    phase as its neighbours. target (v2.17, uniformity): the colours to aim
+    at instead of the source; the backdrop is still found on the source.
     """
     h, w = rgb.shape[:2]
-    lab = rgb_to_lab(rgb).reshape(-1, 3)
+    lab = rgb_to_lab(rgb if target is None else target).reshape(-1, 3)
     base = 1
     mask = None
     if resp.get("key") is not None:
@@ -2345,13 +2351,145 @@ def palette_options(rgb, pals, resp):
     return opts
 
 
+# --------------------------------------------------------------------------
+# v2.17: uniformity between normal and shadow tiles
+# --------------------------------------------------------------------------
+# A normal tile shows the even DAC steps (0, 52, 87 ... 255), a shadow tile the
+# steps 0..7 (0, 29, 52 ... 130). Each tile took the colour nearest to the
+# source on its own grid, so one piece of the drawing that crossed both kinds
+# of tile came out in two colours, one on each side (the author saw it on a
+# ship: a dark disc half normal, half shadow). The uniformity (0..1, 0 = the
+# old way) gives up some fidelity for one colour on both sides. A first pass
+# shows where every source colour went; a colour shown in both states has a
+# home, the state that shows most of its pixels, and then:
+#   - the tiles of the other state pay, in the normal/shadow choice, for the
+#     share of their pixels that belong elsewhere, so a piece of the drawing
+#     moves whole to one state when its tiles allow it;
+#   - the pixels of that colour are aimed, on both sides, at the colour its
+#     home shows, and the palettes are fitted to that aim too. A dark colour
+#     can then look the same in both states (CRAM c in a normal tile and 2c in
+#     a shadow tile: 0, 52, 87 and 116 exist in both grids).
+# The first idea, every shared colour aimed at the nearest colour of both
+# grids, gave the normal tiles a perfect aim and erased the shadow from a ship
+# drawn in shadow tones (29, 70, 101): no longer gradual. Measured by the
+# normal/shadow jump: mean dE between the two sides of every source colour
+# that is shown in both states.
+UNIFORM = 0.0
+UNIFORM_HOME_W = 12.0    # dE a tile pays at 100% when all its pixels live elsewhere
+UNIFORM_MIN_PX = 4       # pixels a source colour needs in each state to count
+_DAC_MIDS = (DAC15[1:] + DAC15[:-1]) / 2.0
+
+
+def set_uniform(u):
+    """Uniformity between normal and shadow tiles, 0..1 (0 = off)."""
+    global UNIFORM
+    u = 0.0 if u is None else float(u)
+    if not 0.0 <= u <= 1.0:
+        raise SystemExit(f"uniformity {u}: use a value from 0 to 1 (0 = off)")
+    UNIFORM = u
+    return u
+
+
+def uniform_of(resp):
+    """The uniformity a run uses: resp["uniform"], else the global; 0 when the
+    shadow is not planned with the palettes (nothing to make uniform)."""
+    if not shadow_on(resp):
+        return 0.0
+    u = resp.get("uniform")
+    return float(UNIFORM if u is None else u)
+
+
+def source_keys(rgb):
+    """A key per pixel: its source colour, each channel on the nearest of the
+    15 DAC steps (3375 keys)."""
+    q = np.searchsorted(_DAC_MIDS, np.asarray(rgb, np.float64))
+    return (q[..., 0] * 225 + q[..., 1] * 15 + q[..., 2]).astype(np.int64)
+
+
+def _both_states(keys, shadow_px, valid):
+    k = keys.reshape(-1)
+    s = np.asarray(shadow_px).reshape(-1)
+    v = valid.reshape(-1)
+    cs = np.bincount(k[v & s], minlength=3375)
+    cn = np.bincount(k[v & ~s], minlength=3375)
+    return cn, cs, (cn >= UNIFORM_MIN_PX) & (cs >= UNIFORM_MIN_PX)
+
+
+def uniform_plan(rgb, shown, shadow_px, u, hole=None):
+    """What the uniformity asks of the second pass, from the first one.
+
+    Returns (target, home) or None when no source colour is in both states:
+    target, the colours to aim at (every colour shown in both states pulled
+    by u toward what its home state shows); home, (cost if shadow, cost if
+    normal) per tile for shadow_choice.
+    """
+    if u <= 0:
+        return None
+    rgb = np.asarray(rgb, np.float64)
+    h, w = rgb.shape[:2]
+    nh, nw = h // 8, w // 8
+    keys = source_keys(rgb)
+    valid = np.ones((h, w), bool) if hole is None else ~np.asarray(hole).reshape(h, w)
+    cn, cs, both = _both_states(keys, shadow_px, valid)
+    if not both.any():
+        return None
+    k = keys.reshape(-1)
+    v = valid.reshape(-1)
+    s = np.asarray(shadow_px).reshape(-1)
+    src = rgb.reshape(-1, 3)
+    shw = np.asarray(shown, np.float64).reshape(-1, 3)
+    home_s = cs > cn
+    side = np.where(home_s[k], s, ~s) & v          # the pixels on their home side
+    cnt = np.maximum(np.bincount(k[side], minlength=3375), 1)
+    ref = np.stack([np.bincount(k[side], shw[side, c], minlength=3375) for c in range(3)],
+                   1) / cnt[:, None]
+    out = src.copy()
+    sel = v & both[k]
+    out[sel] = (1.0 - u) * src[sel] + u * ref[k[sel]]
+    # share of every tile's pixels whose colour lives in the other state
+    away_n = (sel & home_s[k]).reshape(h, w)[:nh * 8, :nw * 8]     # costs a normal tile
+    away_s = (sel & ~home_s[k]).reshape(h, w)[:nh * 8, :nw * 8]    # costs a shadow tile
+    pen_n = away_n.reshape(nh, 8, nw, 8).mean(axis=(1, 3)) * UNIFORM_HOME_W * u
+    pen_s = away_s.reshape(nh, 8, nw, 8).mean(axis=(1, 3)) * UNIFORM_HOME_W * u
+    return out.reshape(h, w, 3), (pen_s, pen_n)
+
+
+def normal_shadow_jump(rgb, shown, shadow_px, hole=None):
+    """(jump, share): mean dE between the normal and the shadow side of every
+    source colour shown in both states (weighted by its smaller side), and the
+    share of the picture on those smaller sides. None without shadow tiles."""
+    if shadow_px is None or not np.any(shadow_px):
+        return None
+    h, w = rgb.shape[:2]
+    keys = source_keys(rgb)
+    valid = np.ones((h, w), bool) if hole is None else ~np.asarray(hole).reshape(h, w)
+    cn, cs, both = _both_states(keys, shadow_px, valid)
+    if not both.any():
+        return (0.0, 0.0)
+    k = keys.reshape(-1)
+    v = valid.reshape(-1)
+    s = np.asarray(shadow_px).reshape(-1)
+    lab = true_lab(np.asarray(shown, np.float64).reshape(-1, 3))
+    sides = []
+    for m, c in ((v & ~s, cn), (v & s, cs)):
+        sides.append(np.stack([np.bincount(k[m], lab[m, j], minlength=3375)
+                               for j in range(3)], 1) / np.maximum(c, 1)[:, None])
+    d = np.sqrt(((sides[0] - sides[1]) ** 2).sum(1))[both]
+    wt = np.minimum(cn, cs)[both].astype(np.float64)
+    return (float((d * wt).sum() / wt.sum()), float(wt.sum() / max(1, int(v.sum()))))
+
+
+def _px_shadow(tile_pal, n):
+    return np.repeat(np.repeat(np.asarray(tile_pal) >= n, 8, 0), 8, 1)
+
+
 SHADOW_MIN_GAIN = 0.75   # dE (tile RMS) shadow must win by to be taken
 SHADOW_NEIGH_W = 3.0     # dE per 4-neighbour in the other state, flat areas
 SHADOW_FLAT_MARGIN = 2.0  # extra dE shadow must win by on a flat tile
 SHADOW_FLAT_STD = 8.0    # source tile Lab std where a tile counts as flat
 
 
-def shadow_choice(rgb, block, n, score=None):
+def shadow_choice(rgb, block, n, score=None, home=None):
     """Normal or shadow per tile, with a margin and neighbour coherence.
 
     The plain argmin let every tile pick on its own: on a smooth sky the
@@ -2361,6 +2499,8 @@ def shadow_choice(rgb, block, n, score=None):
     SHADOW_MIN_GAIN, and a few passes charge SHADOW_NEIGH_W for every
     neighbour in the other state, scaled by how flat the source tile is (on
     detail, edges between tiles are not visible and the cost fades).
+    home (v2.17, uniformity): (cost if shadow, cost if normal) per tile, for
+    the pixels whose source colour lives mostly in the other state.
     Returns effective tile palettes (0..n-1 normal, n..2n-1 shadow).
     """
     h, w = rgb.shape[:2]
@@ -2378,6 +2518,10 @@ def shadow_choice(rgb, block, n, score=None):
     std = lab.std(axis=2).mean(axis=2)
     flat = np.clip(1.0 - std / SHADOW_FLAT_STD, 0.0, 1.0)
     margin = SHADOW_MIN_GAIN + SHADOW_FLAT_MARGIN * flat
+    if home is not None:
+        en = en + home[1]
+        es = es + home[0]
+    nw_ = SHADOW_NEIGH_W * flat
     st = es < en - margin
     nb_tot = np.zeros((nh, nw))
     nb_tot[1:] += 1
@@ -2391,8 +2535,8 @@ def shadow_choice(rgb, block, n, score=None):
         nb[:-1] += f[1:]
         nb[:, 1:] += f[:, :-1]
         nb[:, :-1] += f[:, 1:]
-        cost_s = es + SHADOW_NEIGH_W * flat * (nb_tot - nb)
-        cost_n = en + SHADOW_NEIGH_W * flat * nb
+        cost_s = es + nw_ * (nb_tot - nb)
+        cost_n = en + nw_ * nb
         new = cost_s < cost_n - margin
         if np.array_equal(new, st):
             break
@@ -2708,15 +2852,39 @@ def assign_palettes(rgb, pals, resp):
     them - no bands and no geometric restriction.
     """
     h, w = rgb.shape[:2]
+    u = uniform_of(resp)
+    idx, tile_pal, err = _assign_once(rgb, pals, resp)
+    if u > 0:
+        # v2.17: the colours the first pass showed tell which source colours
+        # sit in both states; the second pass aims them at one colour
+        n = len(pals)
+        hole = backdrop_mask(rgb, resp) if resp.get("key") is not None else None
+        eff = np.asarray(eff_pals(pals, resp), np.uint8)
+        rows = np.repeat(np.repeat(tile_pal, 8, 0), 8, 1)
+        plan = uniform_plan(rgb, eff[rows, idx], _px_shadow(tile_pal, n), u, hole)
+        if plan is not None:
+            idx, tile_pal, _ = _assign_once(rgb, pals, resp, *plan)
+            # the error is still measured against the source
+            rec = eff[np.repeat(np.repeat(tile_pal, 8, 0), 8, 1), idx]
+            e2 = ((rgb_to_lab(rec.reshape(-1, 3).astype(np.float64))
+                   - rgb_to_lab(rgb.reshape(-1, 3).astype(np.float64))) ** 2).sum(1)
+            if hole is not None:
+                e2[hole.reshape(-1)] = 0.0
+            err = float(e2.reshape(h // 8, 8, w // 8, 8).mean(axis=(1, 3)).sum())
+    return idx, tile_pal, err
+
+
+def _assign_once(rgb, pals, resp, target=None, home=None):
+    h, w = rgb.shape[:2]
     nh, nw = h // 8, w // 8
-    opts = palette_options(rgb, pals, resp)
+    opts = palette_options(rgb, pals, resp, target)
     stack = np.stack([o[0] for o in opts])
     block = np.stack([o[1].reshape(nh, 8, nw, 8).mean(axis=(1, 3)) for o in opts])
     score = np.stack([o[2].reshape(nh, 8, nw, 8).mean(axis=(1, 3)) for o in opts])
     tile_pal = block.argmin(0).astype(np.uint8)
     if shadow_on(resp) and len(block) == 2 * len(pals):
         n = len(pals)
-        state = shadow_choice(rgb, block, n, score) >= n
+        state = shadow_choice(rgb, block, n, score, home) >= n
         bn = block[:n].argmin(0)
         bs = block[n:].argmin(0) + n
         tile_pal = np.where(state, bs, bn).astype(np.uint8)
@@ -2763,8 +2931,19 @@ def palettes_for_tiles(rgb, tile_pal, idx, n, resp, seed=0, previous=None, px_we
     lab = rgb_to_lab(rgb).reshape(-1, 3)
     # the error is measured on what is shown; the palette is fitted to what
     # the CRAM must hold (shadow tiles un-shadowed)
+    fit_src = rgb
+    u = uniform_of(resp)
+    if u > 0 and previous is not None:
+        # v2.17: the colours aimed at, so the palettes hold the shared ones
+        plan = uniform_plan(rgb, rec, _px_shadow(tile_pal, n), u,
+                            None if mask is None else mask.reshape(h, w))
+        if plan is not None:
+            fit_src = plan[0]
     tile_pal, sh = split_tile_pal(tile_pal, n)
-    lab_fit = lab if sh is None else rgb_to_lab(shadow_equivalent(rgb, sh)).reshape(-1, 3)
+    if sh is None:
+        lab_fit = lab if fit_src is rgb else rgb_to_lab(fit_src).reshape(-1, 3)
+    else:
+        lab_fit = rgb_to_lab(shadow_equivalent(fit_src, sh)).reshape(-1, 3)
     err = ((rgb_to_lab(rec.reshape(-1, 3)) - lab) ** 2).sum(1).reshape(h, w)
     if mask is not None:
         err.reshape(-1)[mask] = 0.0
@@ -2853,10 +3032,14 @@ def finish_palette(sub, pal_x, resp):
     return np.vstack([chave, pal_x])
 
 
+BAND_MIN_PX = 64   # art pixels a band needs to seed its palette by itself
+
+
 def palettes_per_band(rgb, resp, bands, weights_fn=None, seed=0):
     k = 15
     out = []
-    for i, (y0, y1) in enumerate(bands):
+
+    def art(y0, y1):
         sub = rgb[y0:y1]
         lab = rgb_to_lab(sub).reshape(-1, 3)
         weights = weights_fn(y0, y1, sub, lab) if weights_fn else None
@@ -2866,6 +3049,20 @@ def palettes_per_band(rgb, resp, bands, weights_fn=None, seed=0):
             lab = lab[~m]
             if weights is not None:
                 weights = weights[~m]
+        return sub, lab, weights
+
+    for i, (y0, y1) in enumerate(bands):
+        sub, lab, weights = art(y0, y1)
+        if len(lab) < BAND_MIN_PX:
+            # a band that is (almost) all backdrop - the transparent bottom of
+            # a strip - had no pixels to seed from and k-means divided by zero;
+            # it takes the art of the whole picture (the tiles pick afterwards)
+            sub, lab, weights = art(0, rgb.shape[0])
+        if len(lab) == 0:
+            # nothing but backdrop in the whole picture: a palette of it
+            key = np.asarray(resp.get("key") or (0, 0, 0), np.uint8).reshape(1, 3)
+            out.append(np.repeat(key, 16, 0))
+            continue
         pal_x, _ = kmeans_md(lab, k, weights, seed + i)
         pal_x = refine_palette(lab, pal_x, k, weights, seed + i)
         out.append(finish_palette(sub, pal_x, resp))
@@ -3645,6 +3842,13 @@ def cmd_sample(a):
     if resp["solid_pref"] != 0.5:
         print(f"note: solid colour preference {resp['solid_pref'] * 100:.0f}% "
               "(50% = normal; higher draws fewer dots)")
+    # v2.17: uniformity between normal and shadow tiles (0 = off)
+    un_arg = getattr(a, "uniform", None)
+    resp["uniform"] = set_uniform(un_arg if un_arg is not None
+                                  else resp.get("uniform", 0.0))
+    if resp["uniform"]:
+        print(f"note: normal/shadow uniformity {resp['uniform'] * 100:.0f}% (one colour "
+              "on both sides of a shadow border, less fidelity)")
     gm_arg = getattr(a, "grey", None)
     resp["grey_mode"] = set_grey_mode(gm_arg if gm_arg is not None
                                       else resp.get("grey_mode", False))
@@ -4851,6 +5055,60 @@ def selftest():
           f"{100 * dots[(0.0, 'floyd')]:.0f}% / {100 * dots[(0.5, 'floyd')]:.0f}% / "
           f"{100 * dots[(1.0, 'floyd')]:.0f}% at 0, 50, 100%)")
 
+    # 33. v2.17 normal/shadow uniformity. One source colour in 2 normal tiles
+    # (shown 52,52,52) and 6 shadow tiles (shown 29,29,29): its home is shadow,
+    # the target pulls every pixel toward 29 by u, every tile pays
+    # for being normal, and the jump drops to 0 once both sides show the same.
+    src = np.full((8, 64, 3), 40, np.uint8)
+    shp = np.zeros((8, 64), bool)
+    shp[:, 16:] = True
+    shown = np.where(shp[..., None], 29, 52).astype(np.uint8)
+    shown = np.broadcast_to(shown, (8, 64, 3)).copy()
+    for u in (0.5, 1.0):
+        tgt, (pen_s, pen_n) = uniform_plan(src, shown, shp, u)
+        assert np.allclose(tgt, (1 - u) * 40 + u * 29), tgt[0, 0]
+        assert np.allclose(pen_s, 0.0)
+        assert np.allclose(pen_n, UNIFORM_HOME_W * u)     # any tile pays to be normal
+    assert uniform_plan(src, shown, shp, 0.0) is None
+    j, share = normal_shadow_jump(src, shown, shp)
+    assert j > 5 and abs(share - 0.25) < 1e-9, (j, share)
+    same = np.full((8, 64, 3), 29, np.uint8)
+    assert normal_shadow_jump(src, same, shp)[0] < 1e-9
+    assert normal_shadow_jump(src, shown, np.zeros_like(shp)) is None
+    assert uniform_of({"mode": "normal", "uniform": 1.0}) == 0.0
+    assert uniform_of({"mode": "shadow", "uniform": 0.4}) == 0.4
+    for bad in (-0.1, 1.5):
+        try:
+            set_uniform(bad)
+            raise AssertionError(("accepted", bad))
+        except SystemExit:
+            pass
+    set_uniform(0.0)
+    ok += 1
+    print(f"ok {ok}: normal/shadow uniformity pulls a shared colour to its home "
+          f"state (jump {j:.1f} dE on 25% -> 0 when both sides match)")
+
+    # 34. a strip whose bottom is all transparent (backdrop): the band seed of
+    # the empty bands had no pixel and k-means divided by zero. Now an empty
+    # band takes the art of the whole picture, and a picture of backdrop only
+    # gets palettes of the backdrop colour.
+    strip = np.full((64, 16, 3), 255, np.uint8)
+    yy2, xx2 = np.mgrid[0:24, 0:16]
+    strip[:24] = np.stack([40 + 6 * yy2, 60 + 4 * xx2, 90 + 3 * yy2], 2).astype(np.uint8)
+    rs = dict(palettes=4, palette_file=None, transparency=True, dithering="none",
+              dither_strength="full", cap_scope="image", key=[255, 255, 255],
+              key_src=[255, 255, 255], key_holes=True, mode="normal")
+    for mode in ("normal", "shadow"):
+        ps, _, _ = optimize_palettes(strip, dict(rs, mode=mode), 0, rounds=2)
+        bs = build(strip, ps, dict(rs, mode=mode))
+        assert len(ps) == 4 and bs["de_mean"] < 10, (mode, bs["de_mean"])
+    blank = np.full((32, 16, 3), 255, np.uint8)
+    pb = palettes_per_band(blank, rs, bands_of(32, 4))
+    assert all((np.asarray(p) == 255).all() for p in pb), pb
+    ok += 1
+    print(f"ok {ok}: a strip with an all-transparent bottom converts (dE "
+          f"{bs['de_mean']:.2f}); backdrop only gives backdrop palettes")
+
     print(f"\n{ok}/{ok} tests passed")
     return 0
 
@@ -4955,6 +5213,9 @@ def main():
         p.add_argument("--solid", type=float,
                        help="dots vs solid colour, 0..1 (default 0.5 = normal; "
                             "higher draws fewer dots, lower dithers more)")
+        p.add_argument("--uniform", type=float,
+                       help="normal/shadow uniformity, 0..1 (default 0 = off): one "
+                            "colour on both sides of a shadow border, less fidelity")
         p.add_argument("--grey", choices=("on", "off"),
                        help="grey mode: measure only the grey a monochrome filter "
                             "shows (BlastEm levels, Rec.601)")

@@ -12,7 +12,7 @@ and sample C code).
 4 palettes with Floyd-Steinberg and VDP shadow · 4 palettes with Riemersma and a
 budget of 400 unique tiles per screen.*
 
-One program, three tools, picked from a start screen:
+One program, five tools, picked from a start screen:
 
 ![Start screen](docs/screen_start.png)
 
@@ -20,11 +20,13 @@ One program, three tools, picked from a start screen:
 |---|---|
 | **Sweep · window** | Convert one image: try many combinations at once (palettes × dithering × modes × tile budgets), compare them all in one HTML page and export the one you like. |
 | **Sweep · console** | The sweep from the command line, for scripts and batch work. |
+| **Sprite · window** | Convert the frames of a character in one go: one shared palette, every dither compared **animated**, and an SGDK sprite sheet (`.png`, `.pal`, `.res`). |
+| **Sprite · console** | The sprite converter from the command line. |
 | **Tile editor** | Open an export and rearrange its 8×8 tiles: copy, paste, delete, mirror, and turn each tile's priority on or off. Select a tile to see how many times it is used and where; edit its pixels, switch its palette, and see and replace the colours of the palettes, each in a window of its own. Saving updates the image, the map and the preview. |
 
 ## Quick start (Windows)
 
-1. Download `MD_Background_Tools.exe` from the [release page](https://github.com/ultraover/RenRetroDev/releases/tag/md-background-tools-v2.0).
+1. Download `MD_Background_Tools.exe` from the [release page](https://github.com/ultraover/RenRetroDev/releases/tag/md-background-tools-v2.1).
 2. Double-click it and pick a tool.
 3. In **Sweep · window**, drop an image, tick the combinations to try and
    press the run button. Compare them in the gallery, pick one in **Export one
@@ -139,6 +141,17 @@ default `res/` export folder and any error log in
   diffusions spread less error: smoother and flatter. Lower, it dithers more
   readily: more tones, more grain. The palette of each tile follows the same
   preference. Command line: `--solid 0.7`.
+- **Normal/shadow uniformity (Sweep):** with shadow, one piece of the drawing
+  that crosses normal and shadow tiles comes out in two colours, one on each
+  side (a normal tile shows the even DAC steps, a shadow tile the steps 0 to
+  7). Higher gives up some fidelity for one colour on both sides: every source
+  colour shown in both states takes the colour of the state that shows most of
+  it, the tiles move whole to that state when they can, and the palettes are
+  fitted to it. 0% is off (as before). Type one value or a list in %
+  (`0, 50, 100`): one column each, and only the shadow rows change. Every card
+  shows the **normal/shadow jump**: dE between the two sides of one source
+  colour, and how much of the picture sits on the smaller side. Command line:
+  `--uniform 0,50,100`.
 - **Backdrop:** the border colour becomes the transparent backdrop only when the
   file has transparency, or when almost all of the border is that colour. A sky
   or a gradient at the edge stays part of the art. Or pick a **fixed colour**
@@ -161,6 +174,66 @@ default `res/` export folder and any error log in
   dithering. The numbers are a guide: trust your eyes.
 
 ![Sweep window](docs/screen_sweep.png)
+
+## Sprite converter
+
+Convert the frames of a character in one go. Drop a **folder of frames** on
+the Sprite window (or pick the files) and the frames are grouped into
+animations by name: `walk_01.png`, `walk_02.png` → *walk*; `jump1.png`,
+`jump2.png` → *jump*. Each animation becomes one row of the sprite sheet.
+
+- **One palette for every frame:** 15 colours plus the transparent index 0,
+  made from the pixels of all the frames together, so every frame matches.
+  Or give a **palette file**; **Lock colours** (`RRGGBB, RRGGBB`) keeps
+  colours that must stay exact (eyes, skin, a colour shared with another
+  character); "leave 14 and 15 free" keeps them for PAL3 with
+  shadow/highlight, where they are operators on sprites.
+- **Transparency:** from the alpha channel, a key colour (such as magenta) or
+  the border colour. **Clean edge** repairs the band of a few pixels along the
+  edge, so a soft edge on a coloured background leaves no halo.
+- **Frame size:** SGDK wants one size per sheet, in multiples of 8. "trim to
+  fit" (the default) cuts every frame to the smallest box that holds the
+  character in **every** frame, lined up on the **anchor** (bottom centre by
+  default, so the feet stay on one line); "keep the canvas" only grows it to
+  multiples of 8. The report gives the anchor point inside the frame, for
+  placing the sprite in the game.
+- **Output size:** or pick the size of every frame yourself, from a list of
+  sizes or in tiles (multiples of 8, at most 248 px a side, as rescomp takes).
+  "scale" fits the character to it (every frame alike, aspect kept); "crop"
+  keeps the pixels and cuts what is outside, around the anchor.
+- **Output line:** before you convert, the window shows the frame size and how
+  it splits into **hardware sprites** (1 to 4 tiles a side, 8 to 32 px): how
+  many per frame, their sizes (for example `2x 32x32 + 1x 32x16`), the worst
+  line and the VRAM. It turns red when a frame needs more than **16 hardware
+  sprites**, the most rescomp takes per frame. The split is an estimate:
+  rescomp cuts with its own optimiser. The report lists every frame.
+- **Dithering:** the same dithers, strengths, *Solid vs dots*, colour weight
+  and grey mode as the Sweep, each painted with the shared palette. The
+  ordered dithers are tied to the frame, so they stay put while the
+  character stands still; error diffusion (Floyd and the others) changes its
+  dots from frame to frame.
+- **Gallery (`index.html`):** every variant **animated** next to the
+  original, on a backdrop colour and at a speed you pick, with its numbers:
+  colour error, **flicker** (how much the dots change between neighbouring
+  frames where the picture did not), tiles per frame, and hardware sprites
+  per frame and on the worst line (estimated with 32×32 blocks; rescomp may
+  cut the frame its own way).
+- **Export one variant:** the indexed sprite sheet (`name.png`), `name.pal`,
+  `name.res` with the rescomp line (`SPRITE name "name.png" w h NONE time`,
+  the time from the speed) and `report.md` with C code (`SPR_addSprite`,
+  `SPR_setAnim`). Give a **res folder** to write them straight into your
+  project.
+
+Command line:
+
+```
+MD_Background_Tools.exe --run sprite-console run --source frames --dithering none,ordered2,ordered4 --name hero
+MD_Background_Tools.exe --run sprite-console run --source frames --size 32x48 --fit fit
+MD_Background_Tools.exe --run sprite-console run --source frames --transparency key --key-color FF00FF --edge-clean 2 --lock C80000 --reserve-ops
+MD_Background_Tools.exe --run sprite-console export --run sprite_hero --variant ordered2_balanced --res C:\game\res
+```
+
+![Sprite window](docs/screen_sprite.png)
 
 ## Tile editor
 
@@ -261,10 +334,13 @@ by free memory). Useful sweep flags:
 decided at the end), `--full` (full-size previews), `--view-height 240` (PAL).
 
 **Variations** ("Variations" in the Sweep window, `--variations N`): every
-combination runs N times, with seed 0, 1, 2… (from `--seed`). The seed
-changes where the palette search starts and which tiles are merged first, so
-each variation is another take on the same task; the gallery shows one row per
-seed. The same options and the same seed always give the same picture, on any
+combination runs N times, with seed 0, 1, 2… or from the **first seed** you
+pick ("First seed" in the window, `--seed`): first seed 9 with 1 variation runs
+seed 9 alone, first seed 7 with 3 variations runs 7, 8 and 9. The seed changes
+where the palette search starts (and, when the tile cap applies to the whole
+image, which tiles are merged), so each variation is another take on the same
+task; the gallery shows one row per seed. With a palette file and the cap per
+view, every seed gives the same picture. The same options and the same seed always give the same picture, on any
 number of CPU processes. Variation 0 is the picture a sweep without
 variations makes; the others are named `..._s1`, `..._s2` and export like any
 variant.

@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.1 (2026-11-26)
+
+- Sweep: **normal/shadow uniformity**. With shadow, one piece of the drawing
+  that crossed normal and shadow tiles came out in two colours, one on each
+  side. The new option (0 to 100%, 0 = as before) gives up some fidelity for
+  one colour on both sides: every source colour shown in both states takes the
+  colour of the state that shows most of it, the tiles move whole to that
+  state when they can, and the palettes are fitted to it. Works with every
+  dither. A list (`0, 50, 100`) makes one column each; each card shows the
+  normal/shadow jump. `--uniform 0,50,100`.
+- Fix: a picture with a horizontal stretch that is all backdrop (the
+  transparent bottom of a strip) stopped the conversion with "float division
+  by zero". The palette of that stretch now starts from the art of the whole
+  picture.
+- Sweep window: **First seed**, next to Variations. Pick the seed to start
+  from: 9 with 1 variation runs seed 9 alone (the console already had
+  `--seed`).
+- New tool, **Sprite converter** (window and console): convert the frames of a
+  character in one go. Frames are grouped into animations by name (one row of
+  the sheet each), share one palette made from all of them (or a palette
+  file, with locked colours and 14-15 left free for PAL3 with
+  shadow/highlight), lose their background (alpha, key colour or border, with
+  a halo cleanup along the edge) and are cut to one size in multiples of 8,
+  lined up on an anchor (bottom centre by default). Every dither asked is
+  painted and shown animated in a gallery, with its colour error, flicker
+  between frames, tiles and hardware sprites per frame. Export one variant
+  as an SGDK sprite sheet: indexed `.png`, `.pal`, `.res` (`SPRITE` line) and
+  a report with C code.
+- Sprite converter: **output size**. Pick the size of every frame (a list of
+  sizes, or tiles; multiples of 8 up to 248 px a side, as rescomp takes) and
+  fit the character to it (scaled alike in every frame) or crop it around the
+  anchor. The window shows, before converting, the frame size and its
+  **hardware sprites** (1-4 tiles a side): how many per frame and their sizes,
+  the worst line and the VRAM, in red when a frame needs more than the 16
+  hardware sprites rescomp takes per frame. The report lists every frame.
+  `--size 32x48` or `--size 4x6t`, `--fit fit|crop`.
+- Sprite converter: frames named by numbers only (`0001.png`) were each an
+  animation of their own; they are now one animation named after their folder.
+- Build: big packages the tools never use (PyTorch, OpenCV, onnxruntime...)
+  are left out of the `.exe` even when they are installed.
+
 ## 2.0 (2026-11-17)
 
 - **The Sweep does everything now; the Background tool is off the start

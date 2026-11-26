@@ -3,7 +3,8 @@
 
     python tools/md_tools.py            start screen
     python tools/md_tools.py --run X    run one tool directly
-                                        (X = sweep-gui, sweep-console, tile-editor;
+                                        (X = sweep-gui, sweep-console, sprite-gui,
+                                         sprite-console, tile-editor;
                                          background-gui and background-console
                                          still run, but are off the start
                                          screen: the sweep does what they did)
@@ -24,7 +25,7 @@ for _d in (HERE, SWEEP_DIR):
         sys.path.insert(0, _d)
 
 TITLE = "MD Background Tools"
-VERSION = "2.0"
+VERSION = "2.1"
 
 TOOLS = [
     ("sweep-gui", "Sweep · window",
@@ -33,6 +34,12 @@ TOOLS = [
     ("sweep-console", "Sweep · console",
      "The sweep from the command line: every option as a flag, or drag an "
      "image into the window for the default grid."),
+    ("sprite-gui", "Sprite · window",
+     "Convert the frames of a character in one go: one shared palette, the "
+     "dithers compared animated, and an SGDK sprite sheet (.png, .pal, .res)."),
+    ("sprite-console", "Sprite · console",
+     "The sprite converter from the command line, or drag a folder of frames "
+     "into the window."),
     ("tile-editor", "Tile editor",
      "Open an export and rearrange its 8×8 tiles: copy, paste, delete, mirror "
      "and turn the priority of each tile on or off. See where a tile is used "
@@ -67,12 +74,14 @@ def _attach_console():
 
 def run_tool(name, extra):
     """Run one tool in THIS process."""
-    if name in ("background-console", "sweep-console"):
+    if name in ("background-console", "sweep-console", "sprite-console"):
         _attach_console()
         os.environ["MD_TOOLS_NO_HANDOFF"] = "1"
         sys.argv = [sys.argv[0]] + list(extra)
         if name == "background-console":
             import md_fundo_v2 as tool
+        elif name == "sprite-console":
+            import md_sprite as tool
         else:
             import md_fundo_sweep_v2 as tool
         try:
@@ -86,6 +95,9 @@ def run_tool(name, extra):
         return gui.main()
     if name == "sweep-gui":
         import sweep_gui_v2 as gui
+        return gui.main()
+    if name == "sprite-gui":
+        import sprite_gui as gui
         return gui.main()
     if name == "tile-editor":
         import md_tile_editor as gui
